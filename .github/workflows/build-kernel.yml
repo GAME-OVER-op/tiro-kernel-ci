@@ -235,22 +235,23 @@ jobs:
           chmod +x common/scripts/setlocalversion
           echo '--- overwrote common/scripts/setlocalversion (KMI-preserving custom release) ---'
           head -3 common/scripts/setlocalversion
-          # ---- Kurumi build stamp: force (kurumi@dev) + real build time into /proc/version ----
-          # Kleaf pins a reproducible identity (build-user@build-host, epoch-0 timestamp) inside the
-          # hermetic action, overriding job env + --action_env. Inject the values at the top of
-          # mkcompile_h so the compiled-in banner uses them. Guarded + non-fatal.
+          # ---- Kurumi build stamp: HARD-override (kurumi@dev) + real build time ----
+          # Kleaf pins KBUILD_BUILD_USER/HOST=build-user/build-host and TIMESTAMP=epoch-0 (1970)
+          # inside its sandbox, overriding job env AND --action_env. So force it in mkcompile_h
+          # itself (runs last, inside the compile): an unconditional export beats Kleaf's values,
+          # and date is evaluated at compile time. Guarded + non-fatal (never breaks the build).
           set +e
-          _KTS="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
           for mch in common/scripts/mkcompile_h msm-kernel/scripts/mkcompile_h; do
             [ -f "$mch" ] || continue
             grep -q KURUMI_STAMP "$mch" && continue
             _t="$(mktemp)"
-            { echo '# KURUMI_STAMP'; \
-              echo ': "${KBUILD_BUILD_USER:=kurumi}"; export KBUILD_BUILD_USER'; \
-              echo ': "${KBUILD_BUILD_HOST:=dev}"; export KBUILD_BUILD_HOST'; \
-              echo ": \"\${KBUILD_BUILD_TIMESTAMP:=$_KTS}\"; export KBUILD_BUILD_TIMESTAMP"; \
-              cat "$mch"; } > "$_t" && cat "$_t" > "$mch" && rm -f "$_t"
-            echo "kurumi: stamped $mch"
+            { head -n 1 "$mch"; \
+              echo '# KURUMI_STAMP: force build identity/timestamp (Kleaf pins these otherwise)'; \
+              echo 'export KBUILD_BUILD_USER=kurumi'; \
+              echo 'export KBUILD_BUILD_HOST=dev'; \
+              echo 'export KBUILD_BUILD_TIMESTAMP="$(date -u "+%a %b %e %H:%M:%S UTC %Y")"'; \
+              tail -n +2 "$mch"; } > "$_t" && cat "$_t" > "$mch"
+            echo "kurumi: hard-stamped $mch"
           done
           set -e
 

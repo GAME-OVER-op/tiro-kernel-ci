@@ -5,18 +5,20 @@
 #   (1) WALT cpufreq smoothing, (2) fewer VM background wakeups.
 # Writes ONLY to /sys and /proc -> fully reversible, no partition writes.
 # No log file is written - settings are just applied.
-# Revert: reflash stock init_boot (removes overlay.d).
+#
+# WALT governor comes up late at boot, so we simply wait a few minutes
+# (values are proven to stick once written), then apply ONCE.
+# Revert: reflash stock init_boot.
 # =====================================================================
 
 # ============================ TUNABLES ===============================
 WALT_UP_RATE_US=1000        # pause before ramping UP   (soft; stock=0)
 WALT_DOWN_RATE_US=2000      # pause before ramping DOWN (soft; stock=0)
 WALT_HISPEED_LOAD=90        # %load to reach hispeed (90=stock; try 92-95)
-APPLY_WALT=1
 DIRTY_WB_CS=1500            # dirty writeback 5s -> 15s
 STAT_INTERVAL=10            # vmstat refresh 1s -> 10s
 MGLRU_TTL=1000             # protect working set 1s (fewer refaults)
-APPLY_VM=1
+BOOT_WAIT=300              # wait 5 min so WALT + vendor init are fully up
 # =====================================================================
 
 setv(){
@@ -25,23 +27,19 @@ setv(){
   echo "$2" > "$1" 2>/dev/null
 }
 
-sleep 40      # let vendor drivers/governors settle after boot
+sleep "$BOOT_WAIT"
 
-if [ "$APPLY_WALT" = "1" ]; then
-  for w in /sys/devices/system/cpu/cpufreq/policy*/walt; do
-    [ -d "$w" ] || continue
-    gov=$(cat "$(dirname "$w")/scaling_governor" 2>/dev/null)
-    [ "$gov" = "walt" ] || continue
-    setv "$w/up_rate_limit_us"   "$WALT_UP_RATE_US"
-    setv "$w/down_rate_limit_us" "$WALT_DOWN_RATE_US"
-    setv "$w/hispeed_load"       "$WALT_HISPEED_LOAD"
-  done
-fi
+# WALT cpufreq smoothing (per policy; dir exists only while governor=walt)
+for w in /sys/devices/system/cpu/cpufreq/policy*/walt; do
+  [ -d "$w" ] || continue
+  setv "$w/up_rate_limit_us"   "$WALT_UP_RATE_US"
+  setv "$w/down_rate_limit_us" "$WALT_DOWN_RATE_US"
+  setv "$w/hispeed_load"       "$WALT_HISPEED_LOAD"
+done
 
-if [ "$APPLY_VM" = "1" ]; then
-  setv /proc/sys/vm/dirty_writeback_centisecs "$DIRTY_WB_CS"
-  setv /proc/sys/vm/stat_interval "$STAT_INTERVAL"
-  setv /sys/kernel/mm/lru_gen/min_ttl_ms "$MGLRU_TTL"
-fi
+# VM: fewer background wakeups
+setv /proc/sys/vm/dirty_writeback_centisecs "$DIRTY_WB_CS"
+setv /proc/sys/vm/stat_interval "$STAT_INTERVAL"
+setv /sys/kernel/mm/lru_gen/min_ttl_ms "$MGLRU_TTL"
 
 exit 0
