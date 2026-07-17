@@ -1,0 +1,147 @@
+name: Build tiro ROM (NX769J) — full LineageOS 23.2
+
+# Full LineageOS build (flashable zip + images). This is HEAVY:
+# a free GitHub-hosted runner (~80 GB usable) will very likely run out of disk.
+# Recommended: a self-hosted or large runner (edit runs-on below), or build on
+# your own PC. Kept here so it's ready when you have the hardware.
+on:
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: "Run installclean before building"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    # <-- change to a self-hosted / large-runner label for reliable ROM builds
+    runs-on: ubuntu-24.04
+    env:
+      KBUILD_BUILD_USER: kurumi
+      KBUILD_BUILD_HOST: dev
+    steps:
+      - name: Checkout CI repo (for the local manifest)
+        uses: actions/checkout@v4
+
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 8192
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: /mnt/src
+
+      - name: Give runner user ownership of the build mount
+        run: sudo chown -R "$USER":"$USER" /mnt/src
+
+      - name: Show free space (before sync)
+        run: df -h /mnt/src /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick libelf-dev liblz4-tool \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+
+      - name: Install the 'repo' tool
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name  "tiro-ci"
+          git config --global user.email "tiro-ci@users.noreply.github.com"
+          git config --global color.ui false
+          git config --global advice.detachedHead false
+
+      - name: Configure ccache
+        run: |
+          echo "USE_CCACHE=1"                 >> "$GITHUB_ENV"
+          echo "CCACHE_EXEC=/usr/bin/ccache"  >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=/mnt/src/.ccache"  >> "$GITHUB_ENV"
+          /usr/bin/ccache -M 25G || true
+
+      - name: repo init — LineageOS 23.2 (partial clone)
+        working-directory: /mnt/src
+        run: |
+          mkdir -p lineage && cd lineage
+          repo init --git-lfs --no-clone-bundle \
+            --partial-clone --clone-filter=blob:none \
+            -u https://github.com/LineageOS/android.git -b lineage-23.2
+
+      - name: Add local manifest for tiro
+        working-directory: /mnt/src/lineage
+        run: |
+          mkdir -p .repo/local_manifests
+          cp "$GITHUB_WORKSPACE/local_manifests/nubia_tiro.xml" .repo/local_manifests/
+
+      - name: repo sync
+        working-directory: /mnt/src/lineage
+        run: |
+          repo sync -c -j"$(nproc --all)" \
+            --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
+          echo 'space after sync:'; df -h /mnt/src
+
+      - name: Apply tiro kernel customizations (power-saving + kernel name)
+        working-directory: /mnt/src/lineage
+        run: |
+          FRAG=kernel/nubia/sm8650/arch/arm64/configs/oem/pineapple_diff.config
+          if [ ! -f "$FRAG" ]; then echo "config fragment not found: $FRAG"; exit 1; fi
+          {
+            echo ''
+            echo '# === custom: balanced power-saving (bundles 1/2/3) ==='
+            echo 'CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y'
+            echo '# CONFIG_THERMAL_EMULATION is not set'
+            echo '# CONFIG_THERMAL_STATISTICS is not set'
+            echo '# CONFIG_PM_DEBUG is not set'
+            echo '# CONFIG_PM_ADVANCED_DEBUG is not set'
+            echo 'CONFIG_TCP_CONG_BBR=y'
+            echo 'CONFIG_DEFAULT_BBR=y'
+            echo 'CONFIG_DEFAULT_TCP_CONG="bbr"'
+            echo 'CONFIG_NET_SCH_FQ=y'
+            echo '# === custom: kernel name (uname -r suffix) ==='
+            echo 'CONFIG_LOCALVERSION="-GAME-OVER-op"'
+          } >> "$FRAG"
+          echo 'Applied. Tail of fragment:'; tail -n 20 "$FRAG"
+
+      - name: Build full ROM
+        working-directory: /mnt/src/lineage
+        run: |
+          set -e
+          export USE_CCACHE=1
+          export LOCALVERSION=""
+          source build/envsetup.sh
+          breakfast tiro
+          if [ "${{ github.event.inputs.clean }}" = "true" ]; then
+            mka installclean
+          fi
+          brunch tiro
+
+      - name: Collect artifacts
+        working-directory: /mnt/src/lineage
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
+          OUT=out/target/product/tiro
+          cp -v "$OUT"/lineage-*.zip "$GITHUB_WORKSPACE/out-artifacts/" 2>/dev/null || true
+          for f in boot.img dtbo.img vendor_boot.img init_boot.img recovery.img super_empty.img; do
+            [ -f "$OUT/$f" ] && cp -v "$OUT/$f" "$GITHUB_WORKSPACE/out-artifacts/" || true
+          done
+          ls -la "$GITHUB_WORKSPACE/out-artifacts/" || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiro-rom
+          path: out-artifacts/**
+          if-no-files-found: warn
+          retention-days: 14
