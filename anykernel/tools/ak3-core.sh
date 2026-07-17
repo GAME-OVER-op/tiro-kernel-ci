@@ -1,5 +1,5 @@
-### AnyKernel methods (DO NOT CHANGE)
-## osm0sis @ xda-developers
+### Kurumi Kernel methods (DO NOT CHANGE)
+## Kurumi Kernel
 
 [ "$OUTFD" ] || OUTFD=$1;
 

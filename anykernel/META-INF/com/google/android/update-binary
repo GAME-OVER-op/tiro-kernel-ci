@@ -1,6 +1,6 @@
 #!/sbin/sh
-# AnyKernel3 Backend (DO NOT CHANGE)
-# osm0sis @ xda-developers
+# Kurumi Kernel installer backend (DO NOT CHANGE)
+# Kurumi Kernel
 
 export OUTFD=$2;
 export ZIPFILE="$3";
@@ -273,7 +273,7 @@ debugging() {
   if [ "$debug" ]; then
     ui_print " " "Creating debugging archive in $DIR...";
     [ -f /tmp/recovery.log ] && log=/tmp/recovery.log;
-    tar -czf "$DIR/anykernel3-$(date +%Y-%m-%d_%H%M%S)-debug.tgz" $AKHOME $log;
+    tar -czf "$DIR/kurumi-$(date +%Y-%m-%d_%H%M%S)-debug.tgz" $AKHOME $log;
   fi;
 }
 cleanup() {
@@ -395,10 +395,10 @@ do_vendorlevelcheck() {
 dump_moduleinfo() {
 cat <<EOF > $1;
 id=ak3-helper
-name=AK3 Helper Module
+name=Kurumi Kernel Helper
 version=$(awk '{ print $3 }' $AKHOME/vertmp) $(grep -oE '#.[0-9]' $AKHOME/vertmp)
 versionCode=1
-author=AnyKernel3
+author=Kurumi Kernel
 description=$KERNEL_STRING
 EOF
 }
@@ -551,7 +551,7 @@ if [ -f version ]; then
   ui_printfile version;
   ui_print " ";
 fi;
-ui_print " " "AnyKernel3 by osm0sis @ xda-developers" " ";
+ui_print " " "Kurumi Kernel by kurumi (GAME-OVER-op)" " ";
 grep -oE 'AK_BASE.*' META-INF/com/google/android/updater-script >&2;
 ui_print " ";
 

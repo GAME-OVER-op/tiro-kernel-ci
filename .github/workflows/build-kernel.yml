@@ -235,6 +235,24 @@ jobs:
           chmod +x common/scripts/setlocalversion
           echo '--- overwrote common/scripts/setlocalversion (KMI-preserving custom release) ---'
           head -3 common/scripts/setlocalversion
+          # ---- Kurumi build stamp: force (kurumi@dev) + real build time into /proc/version ----
+          # Kleaf pins a reproducible identity (build-user@build-host, epoch-0 timestamp) inside the
+          # hermetic action, overriding job env + --action_env. Inject the values at the top of
+          # mkcompile_h so the compiled-in banner uses them. Guarded + non-fatal.
+          set +e
+          _KTS="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          for mch in common/scripts/mkcompile_h msm-kernel/scripts/mkcompile_h; do
+            [ -f "$mch" ] || continue
+            grep -q KURUMI_STAMP "$mch" && continue
+            _t="$(mktemp)"
+            { echo '# KURUMI_STAMP'; \
+              echo ': "${KBUILD_BUILD_USER:=kurumi}"; export KBUILD_BUILD_USER'; \
+              echo ': "${KBUILD_BUILD_HOST:=dev}"; export KBUILD_BUILD_HOST'; \
+              echo ": \"\${KBUILD_BUILD_TIMESTAMP:=$_KTS}\"; export KBUILD_BUILD_TIMESTAMP"; \
+              cat "$mch"; } > "$_t" && cat "$_t" > "$mch" && rm -f "$_t"
+            echo "kurumi: stamped $mch"
+          done
+          set -e
 
           # QCOM has TWO strict config gates:
           #   (1) merge_defconfig_fragments -> "Detected overridden config" if a vendor
@@ -396,14 +414,14 @@ jobs:
           echo 'artifacts:'; ls -la "$GITHUB_WORKSPACE/out-artifacts/"
           [ "$got" -ge 1 ] || { echo 'ERROR: neither boot.img nor vendor_boot.img was produced'; exit 1; }
 
-      - name: Package AnyKernel3 flashable zip (kernel only)
+      - name: Package Kurumi flashable zip (kernel only)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
           set -e
           # TEST FIRST WITH RAM-BOOT: `fastboot boot boot.img` (from out-artifacts) loads the
           # kernel into RAM WITHOUT writing any partition -- a bad kernel is undone by a simple
           # reboot (hold Power ~10s), so it CANNOT brick /data. Only after the kernel is confirmed
-          # stable in RAM should you consider the AnyKernel3 zip below (permanent). The zip replaces
+          # stable in RAM should you consider the Kurumi zip below (permanent). The zip replaces
           # ONLY the kernel inside the device's own boot image, preserving the original ramdisk;
           # vbmeta is NOT touched or signed (patch_vbmeta_flag=0).
           DIST=out/msm-kernel-pineapple-gki/dist
@@ -416,7 +434,7 @@ jobs:
           [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
           [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) 2>/dev/null | head -1)"
           if [ -z "$IMG" ] || [ ! -f "$IMG" ]; then
-            echo 'ERROR: raw kernel Image not found; cannot build AnyKernel3 zip'; exit 1
+            echo 'ERROR: raw kernel Image not found; cannot build Kurumi zip'; exit 1
           fi
           echo "kernel image: $IMG"
           AK="$GITHUB_WORKSPACE/anykernel"
@@ -427,9 +445,9 @@ jobs:
           # make sure the flasher binaries stay executable inside the zip
           chmod 0755 "$AK"/tools/* "$AK"/META-INF/com/google/android/update-binary || true
           mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
-          ZIP="$GITHUB_WORKSPACE/out-artifacts/tiro-AnyKernel3-$(date +%Y%m%d).zip"
+          ZIP="$GITHUB_WORKSPACE/out-artifacts/Kurumi_kernel_build${GITHUB_RUN_NUMBER}.zip"
           ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
-          echo 'AnyKernel3 zip contents:'; unzip -l "$ZIP"
+          echo 'Kurumi zip contents:'; unzip -l "$ZIP"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

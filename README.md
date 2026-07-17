@@ -1,157 +1,124 @@
-# tiro-kernel-ci
+# tiro-kernel-ci  -  Kurumi Kernel
 
-CI that **downloads every required repo and builds** for Nubia / RedMagic
-**tiro (NX769J)** on **LineageOS 23.2** (Android 16, Snapdragon 8 Gen 3 / SM8650
-"pineapple", Linux 6.1). No need to upload heavy source archives.
+CI that **downloads every required source and builds** the **Kurumi Kernel** (and,
+optionally, a full ROM) for **Nubia / RedMagic tiro (NX769J / NX769S, RedMagic 9
+Pro)** - Snapdragon 8 Gen 3 / SM8650 "pineapple", Linux 6.1, LineageOS 23.2
+(Android 16). No need to upload heavy source archives.
 
-> **Kernel base = the ORIGINAL nubia/GKI base, NOT OnePlus.** The kernel workflow
-> builds the GKI Image from pristine **AOSP `kernel/common` `android14-6.1`** (the
-> exact GKI branch the device's stock / LineageOS 23.2 ROM tracks, ASB-2026-06-01)
-> and overlays the **nubia msm-kernel + device-trees** on top. Because that GKI is
-> KMI-compatible with the device's stock vendor modules, all the old OnePlus-base
-> hacks (KMI symbol drops, module trims, custom `LOCALVERSION`) are gone -- those
-> were what broke `/data`. **Always test with `fastboot boot boot.img` (RAM),
-> never `fastboot flash boot`.**
->
-> **Note on nubia OEM defconfig fragments** (`oem/pineapple_diff.config` +
-> `oem/boards/tiro_diff.config`): these are intentionally NOT applied. They are meant
-> for the full vendor `pineapple` build (perf/consolidate) where vendor drivers are
-> `=y`; the bare `gki` target forces them to `=m` and the strict `check_merged_defconfig`
-> aborts (`NFC_ST54J y->m`). Those peripheral drivers already exist as stock
-> `vendor_dlkm` modules on the device, so the Image-only GKI build does not need them.
+> **Kernel base = the original nubia / AOSP GKI base, NOT OnePlus.** The kernel
+> workflow builds the GKI Image from pristine **AOSP `kernel/common` `android14-6.1`**
+> (the exact GKI branch the device's stock / LineageOS 23.2 ROM tracks) and overlays
+> the **nubia msm-kernel + device-trees** on top. Because that GKI is KMI-compatible
+> with the device's stock vendor modules, no ABI-breaking symbol drops / module trims
+> are needed. **Always test with `fastboot boot boot.img` (RAM), never
+> `fastboot flash boot`, until the kernel is proven stable.**
 
 ---
 
 ## Two workflows
 
-| File | Workflow | Output | Runner |
-|------|----------|--------|--------|
-| `.github/workflows/build-kernel.yml` | **Build tiro KERNEL** | `boot.img`, `dtbo.img`, `vendor_boot.img` | fits GitHub-hosted (after disk fixes) |
-| `.github/workflows/build-rom.yml` | **Build tiro ROM** | `lineage-*.zip` + images | **needs self-hosted / large runner or local PC** |
+| Workflow file | Builds | Output | Runner |
+|---|---|---|---|
+| `.github/workflows/build-kernel.yml` | **Kernel only** (standalone Kleaf/Bazel GKI) | `boot.img`, `vendor_boot.img`, and `Kurumi_kernel_build<N>.zip` (flashable Kurumi zip) - artifact **`tiro-kernel`** | fits a free GitHub-hosted runner |
+| `.github/workflows/build-rom.yml` | **Full LineageOS 23.2 ROM** | `lineage-*.zip` + images - artifact **`tiro-rom`** | needs a large / self-hosted runner or a local PC |
 
-Both apply the same customizations (power-saving + kernel identity below), so the
-kernel inside the ROM is the same one the kernel workflow produces.
+Both apply the same kernel customizations, so the kernel inside the ROM matches the
+one the kernel workflow produces.
 
-## Files
+## Layout
 ```
-.github/workflows/build-kernel.yml   # kernel images only (lighter)
+.github/workflows/build-kernel.yml   # kernel images + Kurumi flashable zip (lighter)
 .github/workflows/build-rom.yml      # full LineageOS ROM (heavy)
-local_manifests/nubia_tiro.xml       # repos to pull
+anykernel/                           # Kurumi flasher (banner, version, overlay.d, installer)
+local_manifests/nubia_tiro.xml       # ROM repos to pull
+scripts/                             # Kleaf overlay fix-ups used by the kernel build
 ```
 
 ## Use
-1. Create a GitHub repo, copy all files (keep paths), push.
-2. Actions -> pick **Build tiro KERNEL** (recommended first) or **Build tiro ROM**
-   -> **Run workflow**.
-3. Download from the run's **Artifacts** (`tiro-kernel` / `tiro-rom`).
+1. Push these files to a GitHub repo (keep paths).
+2. **Actions -> Build tiro KERNEL -> Run workflow** (recommended first).
+3. Download from the run's **Artifacts** (`tiro-kernel`): flash `Kurumi_kernel_build<N>.zip`
+   in recovery, or RAM-test `boot.img` via fastboot first.
 
 ---
 
-## Customizations baked in automatically (both workflows)
+## Kernel customizations (baked in automatically)
 
-Injected at build time into
-`kernel/nubia/sm8650/arch/arm64/configs/oem/pineapple_diff.config` — no fork needed.
-
-### Balanced power-saving (low risk, reversible, no GKI-ABI impact)
+### Balanced power-saving (low risk, no GKI-ABI impact)
 | Setting | Effect |
 |---|---|
 | `CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y` | Non-urgent workqueues don't wake idle CPUs -> idle battery win |
-| `# CONFIG_THERMAL_EMULATION` / `# CONFIG_THERMAL_STATISTICS` off | Remove pure-debug thermal overhead |
-| `# CONFIG_PM_DEBUG` / `# CONFIG_PM_ADVANCED_DEBUG` off | Remove PM debug overhead |
-| `CONFIG_TCP_CONG_BBR=y` + `DEFAULT_BBR` + `NET_SCH_FQ` | More efficient networking |
+| `# CONFIG_THERMAL_EMULATION` / `# CONFIG_THERMAL_STATISTICS` off | Drop pure-debug thermal overhead |
+| `# CONFIG_PM_DEBUG` / `# CONFIG_PM_ADVANCED_DEBUG` off | Drop PM debug overhead |
 
-### Kernel identity
-| Where | Value | Result |
-|---|---|---|
-| `KBUILD_BUILD_USER` (job env) | `kurumi` | `/proc/version` author |
-| `KBUILD_BUILD_HOST` (job env) | `dev` | -> `(kurumi@dev)` |
+### Boot-critical fix
+`CONFIG_MODULE_SIG_PROTECT` is disabled in the common GKI defconfig so the kernel
+accepts the stock `/system_dlkm` GKI modules (otherwise rfkill/bt/audio fail and the
+boot animation hangs). A CI step extracts the built Image's config and **fails the
+build** if the flag is still on - no "flash and find out".
 
-> **`CONFIG_LOCALVERSION="-GAME-OVER-op"` was intentionally REMOVED.** A custom
-> `LOCALVERSION` changes the kernel vermagic / `uname -r`, which can make the stock
-> vendor modules refuse to load -> storage/crypto fail -> **corrupted `/data`**
-> (the brick that happened). The version string is kept stock for ABI parity; the
-> `kurumi@dev` author still shows in `/proc/version` (that field does NOT affect
-> module loading). ASCII on purpose; for the Japanese form (くるみ / デヴ) change the
-> two `env:` values.
-
-To revert any of these, delete the matching lines in the
-"Apply tiro kernel customizations" step.
+### Build identity
+`KBUILD_BUILD_USER=kurumi`, `KBUILD_BUILD_HOST=dev`, and a real build timestamp are
+forced into `/proc/version` (job env + `--action_env` + an `mkcompile_h` stamp that
+overrides Kleaf's reproducible epoch-0 default). `uname -r` carries the
+`-kurumi-dev-GAME-OVER-op` LOCALVERSION while keeping the `-android14-11` KMI marker,
+so ABI/module parity with the device is preserved.
 
 ---
 
-## Disk / "No space left on device"
+## In-kernel battery tweak (overlay.d)
 
-The earlier `repo sync` failure was the runner running out of disk. Both
-workflows fix it with:
-- **`repo init --partial-clone --clone-filter=blob:none`** — biggest saver.
-- **Swap 8192 -> 2048 MB** and **root-reserve 4096 -> 2048 MB** -> more space to
-  `/mnt/src`.
-- `df -h` diagnostics before/after sync.
+The battery/perf tuning ships **inside the kernel flash** - no separate Magisk
+module. `anykernel/ramdisk/overlay.d/` is injected into the device ramdisk
+(`init_boot` on GKI) and imported by Magisk, which runs `kurumi_battery` on
+`sys.boot_completed`:
 
-Kernel build should fit a free runner. The **ROM** build likely still won't —
-use a self-hosted / large runner (edit `runs-on:` in `build-rom.yml`) or your PC.
+- **WALT cpufreq smoothing:** `up_rate_limit_us=1000`, `down_rate_limit_us=2000`,
+  `hispeed_load=90` on every `walt` policy.
+- **Fewer VM wakeups:** `vm.dirty_writeback_centisecs=1500`, `vm.stat_interval=10`,
+  MGLRU `min_ttl_ms=1000`.
 
----
-
-## Build locally (for when you do it on your PC)
-```bash
-mkdir tiro && cd tiro
-repo init --git-lfs --no-clone-bundle --partial-clone --clone-filter=blob:none \
-     -u https://github.com/LineageOS/android.git -b lineage-23.2
-mkdir -p .repo/local_manifests && cp /path/to/nubia_tiro.xml .repo/local_manifests/
-repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle --no-tags --optimized-fetch
-export KBUILD_BUILD_USER=kurumi KBUILD_BUILD_HOST=dev LOCALVERSION=""
-# apply the power-saving + LOCALVERSION lines to
-#   kernel/nubia/sm8650/arch/arm64/configs/oem/pineapple_diff.config
-source build/envsetup.sh
-breakfast tiro
-mka bootimage dtboimage vendorbootimage -j"$(nproc --all)"   # kernel only
-# brunch tiro                                                # full ROM
-```
-Outputs land in `out/target/product/tiro/`.
+Only `/sys` + `/proc` are written - fully reversible, no partition writes, no log
+file. Requires Magisk (root) present, which imports overlay.d. Tune the values at
+the top of `anykernel/ramdisk/overlay.d/sbin/kurumi_battery`. **Revert:** reflash
+stock `init_boot`.
 
 ---
 
-## Testing / flashing (fastboot)
-> Bootloader unlocked. Back up stock images first.
+## Flashing (fastboot) - test in RAM first
+> Bootloader unlocked. Back up stock `boot` + `init_boot` first.
 
-### 1. ALWAYS test in RAM first (non-destructive, cannot brick)
 ```bash
 adb reboot bootloader
 fastboot boot boot.img      # loads the kernel into RAM ONLY, writes NOTHING
 ```
-- If it boots and `/data` decrypts and everything works for a while -> the kernel is good.
-- If it hangs / bootloops -> just **hold Power ~10 s** to reboot back into the
-  untouched stock kernel. No partition was written, so nothing is damaged.
+- Boots and `/data` decrypts and stays stable -> the kernel is good.
+- Hangs / bootloops -> hold Power ~10 s to reboot back into the untouched stock
+  kernel. Nothing was written, nothing is damaged.
 
-### 2. Only AFTER it is proven stable in RAM, make it permanent
-Prefer the **AnyKernel3 zip** (replaces only the kernel inside stock `boot`,
-keeps the stock ramdisk, does not touch vbmeta). Flashing a full `boot.img`
-directly is riskier (ramdisk mismatch) and is not recommended for this device:
-```bash
-# in recovery / via the AnyKernel3 zip (recommended)
-# — or, at your own risk, permanent boot flash:
-# fastboot flash boot boot.img
-```
+Only **after** it is proven stable in RAM, make it permanent by flashing
+`Kurumi_kernel_build<N>.zip` in recovery (replaces the kernel inside `boot` and adds
+the overlay.d tweak to `init_boot`; does not touch vbmeta).
 
-> ⚠️ **Do NOT** `fastboot flash boot` an unverified kernel. That is exactly what
-> corrupted `/data` before. RAM-boot (`fastboot boot`) first, every time.
+> WARNING: do NOT `fastboot flash boot` an unverified kernel. RAM-boot first, every time.
+
+---
 
 ## Where to make kernel edits later
 - tiro config: `kernel/nubia/sm8650/arch/arm64/configs/oem/boards/tiro_diff.config`
   and platform `.../oem/pineapple_diff.config`
-- source/drivers: `kernel/nubia/sm8650/...`
+- source / drivers: `kernel/nubia/sm8650/...`
 - device-tree overlays: `kernel/nubia/sm8650-devicetrees/qcom/tiro/`
 - vendor kernel modules: `kernel/nubia/sm8650-modules/qcom/opensource/...`
 
 ## Display panel note
 tiro panel = **BF068_RM692H0** (6.8" OLED, FHD+ 1116x2480, command mode, DSC),
-discrete **60/120 Hz** only, no qsync/VRR. Adding 30/48/90 Hz needs vendor
-register command sequences not present in the tree, so it's intentionally left out.
+discrete **60/120 Hz** only, no qsync/VRR. Adding 30/48/90 Hz needs vendor register
+command sequences not present in the tree, so it is intentionally left out.
 
-## Repos pulled (branch lineage-23.2)
+## ROM repos pulled (branch lineage-23.2)
 | Path | Repo (nubia-sm8650-devs/...) |
-|------|------|
+|---|---|
 | device/nubia/tiro | android_device_nubia_tiro |
 | device/nubia/sm8650-common | android_device_nubia_sm8650-common |
 | kernel/nubia/sm8650 | android_kernel_nubia_sm8650 |
@@ -159,3 +126,6 @@ register command sequences not present in the tree, so it's intentionally left o
 | kernel/nubia/sm8650-modules | android_kernel_nubia_sm8650-modules |
 | vendor/nubia/tiro | proprietary_vendor_nubia_tiro |
 | vendor/nubia/sm8650-common | proprietary_vendor_nubia_sm8650-common |
+
+## License
+MIT (see `anykernel/LICENSE`).
