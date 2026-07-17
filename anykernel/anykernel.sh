@@ -1,7 +1,7 @@
-### AnyKernel3 Ramdisk Mod Script
-## osm0sis @ xda-developers
+### Kurumi Kernel Ramdisk Mod Script
+## Kurumi Kernel
 
-### AnyKernel setup
+### Kurumi Kernel setup
 # begin properties
 properties() { '
 kernel.string=tiro kernel (GAME-OVER-op) by kurumi
@@ -13,7 +13,7 @@ do.cleanuponabort=0
 device.name1=tiro
 device.name2=NX769J
 device.name3=NX769S
-device.name4=RedMagic 9 Pro
+device.name4=
 device.name5=
 supported.versions=
 supported.patchlevels=
@@ -29,13 +29,40 @@ no_magisk_check=1
 # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
 . tools/ak3-core.sh
 
-# boot install
-if [ -L "/dev/block/bootdevice/by-name/init_boot_a" -o -L "/dev/block/by-name/init_boot_a" ]; then
-    split_boot # for devices with init_boot ramdisk (GKI, kernel lives in boot)
-    flash_boot # for devices with init_boot ramdisk
-else
-    dump_boot # use split_boot to skip ramdisk unpack, e.g. for devices with init_boot ramdisk
-    write_boot # use flash_boot to skip ramdisk repack, e.g. for devices with init_boot ramdisk
-fi
-## end boot install
+install_overlayd() {
+  [ -d "$home/kurumi_overlay" ] || return 0;
+  mkdir -p "$ramdisk/overlay.d/sbin";
+  cp -rf "$home/kurumi_overlay/." "$ramdisk/overlay.d/";
+  set_perm_recursive 0 0 755 644 "$ramdisk/overlay.d";
+  set_perm_recursive 0 0 755 755 "$ramdisk/overlay.d/sbin";
+}
 
+## Stash overlay.d before any reset wipes the shipped ramdisk dir
+if [ -d "$home/ramdisk/overlay.d" ]; then
+  cp -rf "$home/ramdisk/overlay.d" "$home/kurumi_overlay";
+fi;
+
+if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" ] || [ -e "/dev/block/by-name/init_boot$slot" ] || [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
+  ## ---- GKI: kernel in boot, ramdisk (Magisk + overlay.d) in init_boot ----
+  split_boot;
+  flash_boot;
+  if [ -d "$home/kurumi_overlay" ]; then
+    ui_print " " "Kurumi: installing in-kernel battery tweak (overlay.d) into init_boot...";
+    rm -f "$home"/Image "$home"/Image.gz "$home"/Image-dtb "$home"/Image.gz-dtb "$home"/zImage "$home"/zImage-dtb;
+    reset_ak;
+    block=init_boot;
+    setup_ak;
+    dump_boot;
+    install_overlayd;
+    write_boot;
+  fi;
+else
+  ## ---- legacy: kernel + ramdisk both in boot -> single pass ----
+  dump_boot;
+  if [ -d "$home/kurumi_overlay" ]; then
+    ui_print " " "Kurumi: installing in-kernel battery tweak (overlay.d) into boot...";
+    install_overlayd;
+  fi;
+  write_boot;
+fi;
+## end install

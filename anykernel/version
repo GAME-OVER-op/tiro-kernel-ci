@@ -1,0 +1,12 @@
+Kurumi Kernel - tiro (NX769J / RedMagic 9 Pro, SM8650 pineapple)
+Base: AOSP GKI android14-6.1 + nubia msm-kernel overlay
+Build identity: kurumi@dev
+
+Highlights:
+ - Balanced power saving (WQ_POWER_EFFICIENT, PM/thermal debug off)
+ - Battery tweak baked into the kernel via overlay.d
+   (WALT freq smoothing + fewer VM wakeups; run by Magisk on boot)
+ - Stock KMI / ABI parity (no LOCALVERSION ABI break)
+
+Flashing: RAM-boot test first (fastboot boot boot.img), then flash this zip.
+Revert battery tweak: reflash stock init_boot.
