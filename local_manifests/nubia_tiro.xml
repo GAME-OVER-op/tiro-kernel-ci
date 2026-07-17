@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Local manifest for building LineageOS 23.2 for Nubia/RedMagic "tiro" (NX769J).
+  Mirrors the author's manifest (github, revision lineage-23.2) but keeps only
+  what "tiro" needs (cerro repos are intentionally omitted).
+  Place this file at:  .repo/local_manifests/nubia_tiro.xml
+-->
+<manifest>
+    <remote name="nubia-github"
+            fetch="https://github.com"
+            revision="lineage-23.2" />
+
+    <!-- device -->
+    <project path="device/nubia/tiro"
+             name="nubia-sm8650-devs/android_device_nubia_tiro"
+             remote="nubia-github" />
+    <project path="device/nubia/sm8650-common"
+             name="nubia-sm8650-devs/android_device_nubia_sm8650-common"
+             remote="nubia-github" />
+
+    <!-- kernel (source, device-trees, vendor modules) -->
+    <project path="kernel/nubia/sm8650"
+             name="nubia-sm8650-devs/android_kernel_nubia_sm8650"
+             remote="nubia-github" />
+    <project path="kernel/nubia/sm8650-devicetrees"
+             name="nubia-sm8650-devs/android_kernel_nubia_sm8650-devicetrees"
+             remote="nubia-github" />
+    <project path="kernel/nubia/sm8650-modules"
+             name="nubia-sm8650-devs/android_kernel_nubia_sm8650-modules"
+             remote="nubia-github" />
+
+    <!-- proprietary vendor blobs -->
+    <project path="vendor/nubia/tiro"
+             name="nubia-sm8650-devs/proprietary_vendor_nubia_tiro"
+             remote="nubia-github" />
+    <project path="vendor/nubia/sm8650-common"
+             name="nubia-sm8650-devs/proprietary_vendor_nubia_sm8650-common"
+             remote="nubia-github" />
+</manifest>
