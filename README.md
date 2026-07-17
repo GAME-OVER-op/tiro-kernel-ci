@@ -23,8 +23,9 @@ partition writes, no log file. Requires Magisk (root). Tune values at the top of
 `anykernel/ramdisk/overlay.d/sbin/kurumi_battery`. Revert: reflash stock `init_boot`.
 
 ## Build identity
-`/proc/version` is forced to `(kurumi@dev)` with the real build time by hard-overriding
-`scripts/mkcompile_h` (Kleaf otherwise pins `build-user@build-host` + epoch-0/1970).
+`/proc/version` is forced to `(kurumi@dev)` with the REAL build time by hard-overriding
+`scripts/mkcompile_h`: it sets `KBUILD_BUILD_USER/HOST` and, crucially, `SOURCE_DATE_EPOCH`
+(Kleaf otherwise pins `build-user@build-host` + epoch-0, i.e. 1970).
 
 > Install flow: the kernel is flashed to `boot`; then a second AnyKernel pass
 > re-targets `init_boot` (`reset_ak` + `setup_ak`) and repacks ONLY its ramdisk with

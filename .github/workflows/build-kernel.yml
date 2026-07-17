@@ -235,21 +235,25 @@ jobs:
           chmod +x common/scripts/setlocalversion
           echo '--- overwrote common/scripts/setlocalversion (KMI-preserving custom release) ---'
           head -3 common/scripts/setlocalversion
-          # ---- Kurumi build stamp: HARD-override (kurumi@dev) + real build time ----
-          # Kleaf pins KBUILD_BUILD_USER/HOST=build-user/build-host and TIMESTAMP=epoch-0 (1970)
-          # inside its sandbox, overriding job env AND --action_env. So force it in mkcompile_h
-          # itself (runs last, inside the compile): an unconditional export beats Kleaf's values,
-          # and date is evaluated at compile time. Guarded + non-fatal (never breaks the build).
+          # ---- Kurumi build stamp: HARD-override identity + REAL build time ----
+          # Kleaf pins KBUILD_BUILD_USER/HOST=build-user/build-host AND SOURCE_DATE_EPOCH=0
+          # (=> 'Thu Jan  1 00:00:00 UTC 1970'). The kernel derives the /proc/version time from
+          # SOURCE_DATE_EPOCH, not KBUILD_BUILD_TIMESTAMP, so we must override BOTH. Forcing it
+          # inside mkcompile_h (runs last, in-compile) beats Kleaf; scope is this process only,
+          # so other build steps' reproducibility is unaffected. Guarded + non-fatal.
           set +e
           for mch in common/scripts/mkcompile_h msm-kernel/scripts/mkcompile_h; do
             [ -f "$mch" ] || continue
             grep -q KURUMI_STAMP "$mch" && continue
             _t="$(mktemp)"
             { head -n 1 "$mch"; \
-              echo '# KURUMI_STAMP: force build identity/timestamp (Kleaf pins these otherwise)'; \
+              echo '# KURUMI_STAMP: force identity + real build time (Kleaf pins user/host + SOURCE_DATE_EPOCH=0)'; \
               echo 'export KBUILD_BUILD_USER=kurumi'; \
               echo 'export KBUILD_BUILD_HOST=dev'; \
-              echo 'export KBUILD_BUILD_TIMESTAMP="$(date -u "+%a %b %e %H:%M:%S UTC %Y")"'; \
+              echo '_KURUMI_EPOCH=$(date -u +%s)'; \
+              echo 'export SOURCE_DATE_EPOCH=$_KURUMI_EPOCH'; \
+              echo 'export KBUILD_BUILD_TIMESTAMP="$(date -u -d @$_KURUMI_EPOCH "+%a %b %e %H:%M:%S UTC %Y" 2>/dev/null || date -u "+%a %b %e %H:%M:%S UTC %Y")"'; \
+              echo 'echo "kurumi mkcompile_h: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH TS=$KBUILD_BUILD_TIMESTAMP USER=$KBUILD_BUILD_USER HOST=$KBUILD_BUILD_HOST" >&2'; \
               tail -n +2 "$mch"; } > "$_t" && cat "$_t" > "$mch"
             echo "kurumi: hard-stamped $mch"
           done
