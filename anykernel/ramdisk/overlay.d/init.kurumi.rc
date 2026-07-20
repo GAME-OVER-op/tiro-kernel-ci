@@ -1,8 +1,12 @@
 #
-# Kurumi Kernel - in-kernel battery/perf tweak
-# overlay.d rc imported by Magisk; runs the tuning script on boot_completed.
+# Kurumi Kernel - userspace perf/thermal daemon (Rust, static aarch64)
+# overlay.d rc imported by Magisk. Launches the daemon in the BACKGROUND on
+# boot_completed. We use exec_background (NOT exec): the daemon runs
+# persistently (touch-boost + periodic re-apply), and exec would block the
+# init action forever. The daemon writes ONLY to /sys and /proc -> fully
+# reversible, no partition writes.
 #
 
 on property:sys.boot_completed=1
     chmod 0755 ${MAGISKTMP}/kurumi_battery
-    exec u:r:magisk:s0 root root -- ${MAGISKTMP}/kurumi_battery
+    exec_background u:r:magisk:s0 root root -- ${MAGISKTMP}/kurumi_battery

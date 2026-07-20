@@ -69,6 +69,32 @@ jobs:
             libelf-dev liblz4-tool libssl-dev libxml2-utils lzop rsync zip \
             zlib1g-dev python3 python-is-python3
 
+      - name: Build Kurumi Rust daemon (static aarch64, replaces the shell kurumi_battery)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -e
+          # The daemon is a USERSPACE binary shipped in the AnyKernel overlay.d ramdisk and
+          # launched by Magisk on boot_completed. It touches NO kernel source and does not affect
+          # the kernel build -- it only writes /sys + /proc at runtime (fully reversible).
+          # Android uses bionic (not glibc), so we build a FULLY STATIC musl binary that runs
+          # with no libc dependency. Pure-std crate -> the glibc aarch64 gcc is fine as the
+          # linker driver; Rust's self-contained musl provides crt + libc for the static link.
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-musl
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+          cd kurumi-daemon
+          cargo build --release --target aarch64-unknown-linux-musl
+          BIN=target/aarch64-unknown-linux-musl/release/kurumi
+          [ -f "$BIN" ] || { echo 'ERROR: kurumi daemon binary not produced'; exit 1; }
+          aarch64-linux-gnu-strip "$BIN" || true
+          echo '--- daemon file type ---'; file "$BIN"
+          file "$BIN" | grep -q 'ARM aarch64'      || { echo 'ERROR: daemon is not an aarch64 binary'; exit 1; }
+          file "$BIN" | grep -q 'statically linked' || { echo 'ERROR: daemon is not statically linked (would not run on Android bionic)'; exit 1; }
+          DEST="$GITHUB_WORKSPACE/anykernel/ramdisk/overlay.d/sbin/kurumi_battery"
+          install -D -m0755 "$BIN" "$DEST"
+          echo "--- installed daemon -> $DEST ---"; ls -la "$DEST"
+
       - name: Install the 'repo' tool
         run: |
           mkdir -p ~/bin
@@ -297,6 +323,11 @@ jobs:
             echo ''
             echo '# === custom: balanced power-saving (additive, verified to apply) ==='
             echo 'CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y'
+            echo '# === custom: IPv6 NAT (additive) -> enables `ip6tables -t nat` for dnscrypt. ==='
+            echo '#   deps already satisfied in gki_defconfig: IP6_NF_IPTABLES=y + NF_NAT=y (via'
+            echo '#   IP_NF_NAT=y), so IP6_NF_NAT sticks as =y and passes check_merged_defconfig.'
+            echo '#   This is a CONFIG fragment line only -- NO kernel source is modified.'
+            echo 'CONFIG_IP6_NF_NAT=y'
           } >> "$FRAG"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
           #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
@@ -394,6 +425,12 @@ jobs:
             exit 1
           fi
           echo "OK: CONFIG_MODULE_SIG_PROTECT is disabled in the built kernel Image."
+          # Non-fatal IPv6-NAT probe: proves whether the vendor fragment reached the booting
+          # GKI Image. If absent, the build is still fine -- runtime `ip6tables -t nat` just
+          # would not be available (tell me and we move it to a different merge point).
+          echo "$CFG" | grep -E 'CONFIG_IP6_NF_NAT=' \
+            && echo 'OK: IPv6 NAT is compiled into the built kernel.' \
+            || echo 'NOTE: CONFIG_IP6_NF_NAT not found in the built GKI Image config (vendor fragment may not reach common GKI).'
 
       - name: Collect artifacts (boot.img + vendor_boot.img)
         working-directory: /mnt/src/kp/kernel_platform
@@ -444,6 +481,10 @@ jobs:
           echo "kernel image: $IMG"
           AK="$GITHUB_WORKSPACE/anykernel"
           [ -f "$AK/anykernel.sh" ] || { echo 'ERROR: anykernel/ framework missing from repo'; exit 1; }
+          # The daemon binary must have been produced by the Rust build step above.
+          KB="$AK/ramdisk/overlay.d/sbin/kurumi_battery"
+          [ -f "$KB" ] || { echo 'ERROR: kurumi_battery daemon missing (Rust build step did not run?)'; exit 1; }
+          file "$KB" | grep -q 'ELF' || { echo 'ERROR: kurumi_battery is not an ELF binary'; exit 1; }
           # drop the freshly built kernel in, replacing any stale image
           rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb
           cp -v "$IMG" "$AK/$(basename "$IMG")"
