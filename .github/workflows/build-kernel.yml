@@ -341,42 +341,33 @@ jobs:
           # No module infra on device (/lib/modules absent) -> must be builtin =y.
           # This edits a defconfig (CONFIG, not kernel source); common/ is a fresh
           # clone, so no user source tree is touched.
+          #
+          # IMPORTANT: do NOT try to canonicalize via a standalone `make gki_defconfig
+          # savedefconfig` here. A bare make outside the Kleaf/android fragment context
+          # cannot resolve ~6 symbols and silently shrinks the defconfig (observed
+          # 671 -> 665). The real dist build does NOT enforce a byte-match check_defconfig
+          # on common (it already ships a non-canonical gki_defconfig and builds fine),
+          # so we just enable the symbol IN PLACE and let the real build's olddefconfig
+          # pick it up. The post-build 'Verify' step asserts it actually landed in the
+          # Image, which is the real proof.
           # ===================================================================
-          if ! grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF"; then
-            echo 'CONFIG_IP6_NF_NAT=y' >> "$CDEF"
+          if grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF"; then
+            echo 'IP6_NF_NAT already enabled in common gki_defconfig'
+          else
+            # Insert right after the last existing CONFIG_IP6_NF_* line: if some strict
+            # savedefconfig check IS enforced in the hermetic build, the symbol already
+            # sits in its canonical ipv6-netfilter position; if not, position is moot.
+            last_ip6=$(grep -n '^CONFIG_IP6_NF_' "$CDEF" | tail -n1 | cut -d: -f1)
+            if [ -n "$last_ip6" ]; then
+              sed -i "${last_ip6}a CONFIG_IP6_NF_NAT=y" "$CDEF"
+            else
+              echo 'CONFIG_IP6_NF_NAT=y' >> "$CDEF"
+            fi
           fi
-          # The strict GKI check_defconfig gate compares `make savedefconfig` byte-for-byte
-          # against the checked-in gki_defconfig, so a raw appended line would fail it.
-          # Canonicalize exactly like the AOSP workflow (edit gki_defconfig, then
-          # `make gki_defconfig savedefconfig`). The current defconfig already passes that
-          # gate, so savedefconfig reproduces it verbatim and merely inserts our new symbol
-          # in canonical order -- no other line changes. Kconfig-only targets, so the host
-          # toolchain suffices (no clang / cross-compiler needed here).
-          PRE_LINES=$(grep -c '^CONFIG' "$CDEF")
-          (
-            cd common
-            make -s ARCH=arm64 O=out_kurumi_regen gki_defconfig
-            make -s ARCH=arm64 O=out_kurumi_regen savedefconfig
-            cp out_kurumi_regen/defconfig arch/arm64/configs/gki_defconfig
-            rm -rf out_kurumi_regen
-          )
-          POST_LINES=$(grep -c '^CONFIG' "$CDEF")
-          echo "gki_defconfig CONFIG lines: $PRE_LINES -> $POST_LINES"
-          # SANITY: a canonical regen of an already-canonical defconfig must stay ~same size.
-          # A drastic shrink means `make gki_defconfig` did not reproduce the base -> abort
-          # rather than ship a kernel built from a gutted config.
-          if [ "$POST_LINES" -lt $((PRE_LINES - 5)) ]; then
-            echo "ERROR: regen shrank gki_defconfig ($PRE_LINES -> $POST_LINES); base not reproduced. Aborting."; exit 1
-          fi
-          # HARD GUARD 1: IP6_NF_NAT must survive dependency resolution (else silently useless).
-          grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF" || {
-            echo 'ERROR: CONFIG_IP6_NF_NAT did not stick in common gki_defconfig after savedefconfig (unmet dependency?). Aborting.'; exit 1; }
-          # HARD GUARD 2: the regen must not resurrect MODULE_SIG_PROTECT (boot-critical).
-          if grep -q '^CONFIG_MODULE_SIG_PROTECT=y' "$CDEF"; then
-            echo 'ERROR: MODULE_SIG_PROTECT came back =y after defconfig regen. Aborting.'; exit 1
-          fi
-          echo '--- common gki_defconfig now (IPv6 NAT + sig-protect state): ---'
-          grep -nE 'IP6_NF_NAT|MODULE_SIG_PROTECT' "$CDEF" || true
+          grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF" \
+            || { echo 'ERROR: failed to add CONFIG_IP6_NF_NAT to common gki_defconfig'; exit 1; }
+          echo '--- common gki_defconfig IPv6 NAT context: ---'
+          grep -nE 'IP6_NF_IPTABLES|IP6_NF_NAT|IP6_NF_TARGET' "$CDEF" || true
 
           echo '--- gki_defconfig debug/thermal lines now: ---'
           grep -nE 'PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|MODULE_SIG_PROTECT' "$DEF" || true
