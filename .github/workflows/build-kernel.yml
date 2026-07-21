@@ -292,6 +292,27 @@ jobs:
             echo "kurumi: hard-stamped $mch"
           done
           set -e
+          # ---- Kurumi build TIMESTAMP fix (init/Makefile utsversion path, Linux 6.1) ----
+          # In 6.1 the /proc/version build time comes from init/Makefile (utsversion.h),
+          # NOT from mkcompile_h. Kleaf runs the make action with SOURCE_DATE_EPOCH=0 and does
+          # not forward our KBUILD_BUILD_TIMESTAMP into it, so $(shell LC_ALL=C date) resolves
+          # via the hermetic date to 'Thu Jan  1 00:00:00 UTC 1970'. mkcompile_h only fixes
+          # user@host. FIX: hardcode build-timestamp to a real literal computed here on the
+          # runner, bypassing env + hermetic date entirely. Idempotent + guarded.
+          set +e
+          KURUMI_TS="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          _ts_ok=0
+          for mk in common/init/Makefile msm-kernel/init/Makefile; do
+            [ -f "$mk" ] || continue
+            grep -q 'KURUMI_TS_FIX' "$mk" && { _ts_ok=1; continue; }
+            if grep -qE '^[[:space:]]*build-timestamp[[:space:]]*:?=' "$mk"; then
+              sed -i -E "s|^([[:space:]]*)build-timestamp[[:space:]]*:?=.*|\1# KURUMI_TS_FIX\n\1build-timestamp = ${KURUMI_TS}|" "$mk"
+              echo "kurumi: patched build-timestamp in $mk ->"; grep -nE '^[[:space:]]*build-timestamp[[:space:]]*=' "$mk"
+              _ts_ok=1
+            fi
+          done
+          [ "$_ts_ok" = 1 ] || echo 'WARN: build-timestamp not found in init/Makefile; timestamp fix NOT applied' >&2
+          set -e
 
           # QCOM has TWO strict config gates:
           #   (1) merge_defconfig_fragments -> "Detected overridden config" if a vendor
@@ -420,6 +441,21 @@ jobs:
             --action_env=KBUILD_BUILD_HOST \
             --action_env=KBUILD_BUILD_TIMESTAMP
 
+      - name: Stash stock kernel Image (variant 1 of 2)
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          IMG=""
+          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
+          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
+          [ -n "$IMG" ] || { echo 'ERROR: stock kernel Image not found'; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/kimg"
+          cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_stock"
+          basename "$IMG" > "$GITHUB_WORKSPACE/kimg/imgname"
+          echo "stashed stock image: $IMG (flash name $(cat "$GITHUB_WORKSPACE/kimg/imgname"))"
+
       - name: Print kernel release string (diagnostic, non-fatal)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
@@ -479,29 +515,75 @@ jobs:
             exit 1
           fi
 
-      - name: Collect artifacts (boot.img + vendor_boot.img)
+      - name: Integrate KernelSU-Next + susfs (variant 2 prep, non-fatal)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
-          set -e
-          mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
-          DIST=out/msm-kernel-pineapple-gki/dist
-          if [ ! -d "$DIST" ]; then
-            DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          # BEST-EFFORT. The stock Image is already built and stashed, so nothing here can
+          # regress the working kernel. If integration fails we skip variant 2 and the zip
+          # ships stock-only. susfs patches kernel C source (explicitly accepted for this feature).
+          set +e
+          set -x
+          rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
+          ksu_rc=1; sus_rc=1
+          # 1) KernelSU-Next (next branch) into the GKI kernel (common/ = the tree the flashed Image is built from).
+          #    CONFIG_KSU defaults y from the driver Kconfig, so we do NOT touch common gki_defconfig
+          #    (adding lines there fails the strict GKI check_defconfig savedefconfig gate).
+          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next )
+          ksu_rc=$?
+          # 2) susfs4ksu -- branch MUST match the kernel line (gki-android14-6.1).
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1
+          SUS="$PWD/susfs4ksu/kernel_patches"
+          cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
+          cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
+          ( cd common && patch -p1 < "$SUS/50_add_susfs_in_gki-android14-6.1.patch" )
+          sus_rc=$?
+          # 3) KSU-side susfs enable patch (tolerant -- recent KSU-Next may already bundle susfs).
+          KSUD="$(find . -maxdepth 3 -type d -name 'KernelSU-Next' | head -1)"
+          if [ -n "$KSUD" ] && [ -f "$SUS/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            ( cd "$KSUD" && patch -p1 < "$SUS/KernelSU/10_enable_susfs_for_ksu.patch" ) \
+              || echo "WARN: KSU-side susfs patch did not apply cleanly (likely already integrated) - continuing"
           fi
-          echo "dist dir: $DIST"
-          got=0
-          for f in boot.img vendor_boot.img; do
-            src="$DIST/$f"
-            [ -f "$src" ] || src="$(find out -type f -name "$f" 2>/dev/null | head -1)"
-            if [ -n "$src" ] && [ -f "$src" ]; then
-              cp -v "$src" "$GITHUB_WORKSPACE/out-artifacts/"
-              got=$((got+1))
-            else
-              echo "WARNING: $f not found in build output"
-            fi
-          done
-          echo 'artifacts:'; ls -la "$GITHUB_WORKSPACE/out-artifacts/"
-          [ "$got" -ge 1 ] || { echo 'ERROR: neither boot.img nor vendor_boot.img was produced'; exit 1; }
+          # 4) Drop GKI protected-export lists so susfs symbol changes do not trip the ABI gate.
+          rm -f common/android/abi_gki_protected_exports_* 2>/dev/null
+          set +x
+          if [ "$ksu_rc" = 0 ] && [ "$sus_rc" = 0 ]; then
+            echo ok > "$GITHUB_WORKSPACE/kimg/ksu_ok"
+            echo "KSU + susfs integration OK - will build variant 2."
+          else
+            echo "WARN: KSU/susfs integration failed (ksu_rc=$ksu_rc sus_rc=$sus_rc) - zip ships STOCK only."
+          fi
+          exit 0
+
+      - name: Build kernel (KernelSU variant, non-fatal)
+        working-directory: /mnt/src/kp/kernel_platform
+        env:
+          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
+        run: |
+          set +e
+          [ -f "$GITHUB_WORKSPACE/kimg/ksu_ok" ] || { echo 'KSU integration skipped - not building variant 2.'; exit 0; }
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
+            --jobs=2 --local_ram_resources=9830 \
+            --nokleaf_localversion \
+            --action_env=LOCALVERSION \
+            --action_env=KBUILD_BUILD_USER \
+            --action_env=KBUILD_BUILD_HOST \
+            --action_env=KBUILD_BUILD_TIMESTAMP
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "WARN: KSU variant build failed (rc=$rc) - zip ships STOCK only."
+            rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0
+          fi
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          IMG=""
+          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
+          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
+          if [ -z "$IMG" ]; then echo 'WARN: KSU Image not found post-build - shipping STOCK only'; rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0; fi
+          CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
+          echo "$CFG" | grep -E '^CONFIG_KSU=y' && echo 'OK: CONFIG_KSU=y baked into KSU Image' || echo 'WARN: CONFIG_KSU=y not detected in KSU Image config'
+          cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu"
+          echo "stashed KSU image: $IMG -> kimg/kurumi_ksu"
 
       - name: Package Kurumi flashable zip (kernel only)
         working-directory: /mnt/src/kp/kernel_platform
@@ -513,20 +595,11 @@ jobs:
           # stable in RAM should you consider the Kurumi zip below (permanent). The zip replaces
           # ONLY the kernel inside the device's own boot image, preserving the original ramdisk;
           # vbmeta is NOT touched or signed (patch_vbmeta_flag=0).
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
-          # locate the raw kernel image (prefer compressed Image.gz, else Image)
-          IMG=""
-          for cand in Image.gz Image; do
-            [ -f "$DIST/$cand" ] && { IMG="$DIST/$cand"; break; }
-          done
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) 2>/dev/null | head -1)"
-          if [ -z "$IMG" ] || [ ! -f "$IMG" ]; then
-            echo 'ERROR: raw kernel Image not found; cannot build Kurumi zip'; exit 1
-          fi
-          echo "kernel image: $IMG"
           AK="$GITHUB_WORKSPACE/anykernel"
+          KIMG="$GITHUB_WORKSPACE/kimg"
+          [ -f "$KIMG/kurumi_stock" ] || { echo 'ERROR: stashed stock kernel image missing; cannot build zip'; exit 1; }
+          IMGNAME="$(cat "$KIMG/imgname" 2>/dev/null || echo Image.gz)"
+          echo "stock image: $KIMG/kurumi_stock (flash name: $IMGNAME)"
           [ -f "$AK/anykernel.sh" ] || { echo 'ERROR: anykernel/ framework missing from repo'; exit 1; }
           # All three profile binaries must have been produced by the Rust step above.
           for p in eco balance full; do
@@ -539,8 +612,18 @@ jobs:
           [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
           [ -f "$AK/kurumi_gpu.dtb" ]       || { echo 'ERROR: kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
           # drop the freshly built kernel in, replacing any stale image
-          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb
-          cp -v "$IMG" "$AK/$(basename "$IMG")"
+          # Ship BOTH kernel variants under names AnyKernel will NOT auto-detect; the flash-time
+          # menu copies the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a
+          # bare Image/Image.gz here or AnyKernel would auto-flash it and bypass the choice.
+          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb "$AK"/kurumi_stock "$AK"/kurumi_ksu
+          cp -v "$KIMG/kurumi_stock" "$AK/kurumi_stock"
+          printf '%s\n' "$IMGNAME" > "$AK/kurumi_imgname"
+          if [ -f "$KIMG/ksu_ok" ] && [ -f "$KIMG/kurumi_ksu" ]; then
+            cp -v "$KIMG/kurumi_ksu" "$AK/kurumi_ksu"
+            echo "packaging BOTH variants: stock + KernelSU-Next (susfs)"
+          else
+            echo "packaging STOCK ONLY (KSU variant unavailable this run)"
+          fi
           # make sure the flasher binaries stay executable inside the zip
           chmod 0755 "$AK"/tools/* "$AK"/META-INF/com/google/android/update-binary || true
           mkdir -p "$GITHUB_WORKSPACE/out-artifacts"

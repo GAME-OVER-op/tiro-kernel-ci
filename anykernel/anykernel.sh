@@ -73,6 +73,26 @@ if [ "$KGPU" = "1" ] && [ -f "$home/kurumi_gpu.dtb" ]; then
   ui_print " " "Kurumi: custom GPU frequency table will be flashed into boot";
 fi;
 
+## ---- Kernel image selection: stock vs KernelSU-Next + susfs ----
+## CI ships BOTH variants under names AnyKernel will NOT auto-detect (kurumi_stock / kurumi_ksu)
+## plus the real image basename in kurumi_imgname. Copy the chosen variant to $home/<name> so
+## AnyKernel's split_boot/flash_boot picks it up. If KSU was requested but its image is missing
+## (e.g. the KSU build was skipped this run), fall back to stock with a warning.
+IMGNAME="Image.gz";
+[ -f "$home/kurumi_imgname" ] && IMGNAME="$(cat "$home/kurumi_imgname")";
+KSEL="";
+if [ "$KKSU" = "1" ] && [ -f "$home/kurumi_ksu" ]; then
+  KSEL="$home/kurumi_ksu";
+  ui_print " " "Kurumi: flashing KernelSU-Next + susfs kernel";
+elif [ -f "$home/kurumi_stock" ]; then
+  KSEL="$home/kurumi_stock";
+  ui_print " " "Kurumi: flashing stock (no-root) kernel";
+fi;
+if [ -n "$KSEL" ]; then
+  cp -f "$KSEL" "$home/$IMGNAME";
+fi;
+rm -f "$home/kurumi_stock" "$home/kurumi_ksu";
+
 if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" ] || [ -e "/dev/block/by-name/init_boot$slot" ] || [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
   ## ---- GKI: kernel (+ optional GPU dtb) in boot, ramdisk (Magisk + overlay.d) in init_boot ----
   split_boot;

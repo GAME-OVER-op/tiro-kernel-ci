@@ -1,7 +1,7 @@
 #
 # Kurumi Kernel - interactive flash-time menu (getevent / keycheck driven)
 # Sourced by anykernel.sh AFTER tools/ak3-core.sh so ui_print/$bin/abort exist.
-# Exports: KPROFILE (eco|balance|full), KSELINUX (permissive|enforcing), KGPU (0|1)
+# Exports: KKSU (0|1), KPROFILE (eco|balance|full), KSELINUX (permissive|enforcing), KGPU (0|1)
 #
 # Key model ($FUNCTION returns 0 for Vol Up, 1 for Vol Down):
 #   binary menus  -> Vol Up = Yes/first  | Vol Down = No/second
@@ -60,6 +60,25 @@ else
   $FUNCTION "UP";
   ui_print "   Press Vol Down...";
   $FUNCTION "DOWN";
+fi;
+
+# ---- 0) Root: KernelSU-Next + susfs (asked only if the KSU image is in the zip) ----
+if [ -f "$home/kurumi_ksu" ]; then
+  ui_print " ";
+  ui_print "------------------------------";
+  ui_print " Root: KernelSU-Next + susfs?";
+  ui_print "   Vol+ = Yes  (install KSU kernel)";
+  ui_print "   Vol- = No   (clean stock kernel)";
+  ui_print "------------------------------";
+  if $FUNCTION; then
+    KKSU=1;
+    ui_print " " "   -> KernelSU-Next + susfs selected";
+  else
+    KKSU=0;
+    ui_print " " "   -> Stock kernel (no root) selected";
+  fi;
+else
+  KKSU=0;
 fi;
 
 # ---- 1) CPU battery profile (scrolling cursor menu) ----
