@@ -84,16 +84,24 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
           cd kurumi-daemon
-          cargo build --release --target aarch64-unknown-linux-musl
-          BIN=target/aarch64-unknown-linux-musl/release/kurumi
-          [ -f "$BIN" ] || { echo 'ERROR: kurumi daemon binary not produced'; exit 1; }
-          aarch64-linux-gnu-strip "$BIN" || true
-          echo '--- daemon file type ---'; file "$BIN"
-          file "$BIN" | grep -q 'ARM aarch64'      || { echo 'ERROR: daemon is not an aarch64 binary'; exit 1; }
-          file "$BIN" | grep -q 'statically linked' || { echo 'ERROR: daemon is not statically linked (would not run on Android bionic)'; exit 1; }
-          DEST="$GITHUB_WORKSPACE/anykernel/ramdisk/overlay.d/sbin/kurumi_battery"
-          install -D -m0755 "$BIN" "$DEST"
-          echo "--- installed daemon -> $DEST ---"; ls -la "$DEST"
+          # Build all THREE battery profiles from the single source. Each profile
+          # differs ONLY in the CPUFREQ_LIMITS table (selected by a cargo feature).
+          # The flasher installs whichever one the user picks at flash time.
+          BINDIR="$GITHUB_WORKSPACE/anykernel/kurumi_bin"
+          mkdir -p "$BINDIR"
+          for p in eco balance full; do
+            echo "=== building kurumi profile: $p ==="
+            cargo build --release --target aarch64-unknown-linux-musl --no-default-features --features "$p"
+            BIN=target/aarch64-unknown-linux-musl/release/kurumi
+            [ -f "$BIN" ] || { echo "ERROR: kurumi ($p) binary not produced"; exit 1; }
+            aarch64-linux-gnu-strip "$BIN" || true
+            file "$BIN"
+            file "$BIN" | grep -q 'ARM aarch64'      || { echo "ERROR: $p daemon is not an aarch64 binary"; exit 1; }
+            file "$BIN" | grep -q 'statically linked' || { echo "ERROR: $p daemon is not statically linked"; exit 1; }
+            install -D -m0755 "$BIN" "$BINDIR/kurumi_$p"
+            rm -f "$BIN"   # force a clean relink for the next feature set
+          done
+          echo '--- built profile binaries ---'; ls -la "$BINDIR"
 
       - name: Install the 'repo' tool
         run: |
@@ -520,10 +528,16 @@ jobs:
           echo "kernel image: $IMG"
           AK="$GITHUB_WORKSPACE/anykernel"
           [ -f "$AK/anykernel.sh" ] || { echo 'ERROR: anykernel/ framework missing from repo'; exit 1; }
-          # The daemon binary must have been produced by the Rust build step above.
-          KB="$AK/ramdisk/overlay.d/sbin/kurumi_battery"
-          [ -f "$KB" ] || { echo 'ERROR: kurumi_battery daemon missing (Rust build step did not run?)'; exit 1; }
-          file "$KB" | grep -q 'ELF' || { echo 'ERROR: kurumi_battery is not an ELF binary'; exit 1; }
+          # All three profile binaries must have been produced by the Rust step above.
+          for p in eco balance full; do
+            KB="$AK/kurumi_bin/kurumi_$p"
+            [ -f "$KB" ] || { echo "ERROR: profile binary kurumi_$p missing (Rust build step did not run?)"; exit 1; }
+            file "$KB" | grep -q 'ELF' || { echo "ERROR: kurumi_$p is not an ELF binary"; exit 1; }
+          done
+          # interactive-installer assets must be shipped too
+          [ -f "$AK/tools/keycheck" ]       || { echo 'ERROR: tools/keycheck missing'; exit 1; }
+          [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
+          [ -f "$AK/kurumi_gpu.dtb" ]       || { echo 'ERROR: kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
           # drop the freshly built kernel in, replacing any stale image
           rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb
           cp -v "$IMG" "$AK/$(basename "$IMG")"
