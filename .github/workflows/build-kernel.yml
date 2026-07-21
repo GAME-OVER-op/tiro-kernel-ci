@@ -87,7 +87,7 @@ jobs:
           # Build all THREE battery profiles from the single source. Each profile
           # differs ONLY in the CPUFREQ_LIMITS table (selected by a cargo feature).
           # The flasher installs whichever one the user picks at flash time.
-          BINDIR="$GITHUB_WORKSPACE/anykernel/kurumi_bin"
+          BINDIR="$GITHUB_WORKSPACE/anykernel/files/kurumi_bin"
           mkdir -p "$BINDIR"
           for p in eco balance full; do
             echo "=== building kurumi profile: $p ==="
@@ -575,31 +575,38 @@ jobs:
             ksu_rc=1
           fi
 
-          # ---- 2b) BAKE the KSU version into the Makefile (ROOT CAUSE of on-device v0.0.1) ----
-          # KernelSU-Next/kernel/Makefile derives its versionCode at COMPILE time from
-          #   `git rev-list --count HEAD` (needs .git) OR a curl to the GitHub API (needs network).
-          # Kleaf/Bazel compiles inside a HERMETIC sandbox with NEITHER -> the Makefile hits its
-          # fallback and the driver reports v0.0.1 (versionCode too low; the manager rejects it).
-          # The full clone above only fixes the SETUP step, not the compile. So hardcode the real
-          # commit count NOW (git still works here on the runner) and force the .git branch, so the
-          # compile needs no git and no network. Diagnostics print the version block before/after.
+          # ---- 2b) BAKE the KSU version into kernel/Kbuild (ROOT CAUSE of on-device v0.0.1) ----
+          # PROVEN from the KernelSU-Next source (kernel/Kbuild, NOT kernel/Makefile): the
+          #   versionCode is  KSU_VERSION = 30000 + $(git rev-list --count HEAD)  and is guarded by
+          #   KSU_GIT_VERSION_VALID, which is set ONLY when a .git repo is detected via
+          #   `git rev-parse --show-toplevel`. Under the Kleaf/Bazel HERMETIC sandbox there is no
+          #   .git and no network, so that guard stays unset and Kbuild falls back to
+          #   -DKSU_VERSION=1 / tag v0.0.1 -> the manager rejects it. (My earlier Makefile patch
+          #   touched the wrong file, hence "still v0.0.1".)
+          # FIX: compute the real commit count + tag NOW (git works on the runner) and inject them
+          #   as UNCONDITIONAL defs at the top of Kbuild, so the compile needs neither git nor
+          #   network and reports the true version (30000 + count).
           if [ "$ksu_rc" = 0 ]; then
-            KMK="$(find . -path '*KernelSU-Next/kernel/Makefile' 2>/dev/null | head -1)"
-            if [ -n "$KMK" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
-              echo "--- KSU Makefile version lines BEFORE bake ($KMK) ---"
-              grep -nE 'KSU_GIT_VERSION|KSU_VERSION|rev-list|\.git|curl' "$KMK" || true
-              # force the ".git exists" guard to be true (the sandbox has no .git):
-              sed -i -E 's/test -e [^;]*\.git[^;]*; *echo \$\$\?/echo 0/g' "$KMK"
-              # replace the live git command with the precomputed count (offline-safe):
-              sed -i "s/git rev-list --count HEAD/echo $KSU_CNT/g" "$KMK"
-              # hardcode the version variable outright, whatever its RHS was (git OR curl):
-              sed -i -E "s/(KSU_GIT_VERSION[[:space:]]*:?=[[:space:]]*).*/\\1$KSU_CNT/" "$KMK"
-              # neutralize the unshallow fetch (would fail / stall offline):
-              sed -i 's/git fetch --unshallow/true/g' "$KMK"
-              echo "--- KSU Makefile version lines AFTER bake (expect count=$KSU_CNT, guard forced) ---"
-              grep -nE 'KSU_GIT_VERSION|KSU_VERSION|echo 0|echo '"$KSU_CNT" "$KMK" || true
+            KB="$(find . -path '*KernelSU-Next/kernel/Kbuild' 2>/dev/null | head -1)"
+            KSU_TAG="$(cd common/KernelSU-Next 2>/dev/null && git describe --tags --abbrev=0 2>/dev/null || echo v1.0.0)"
+            if [ -n "$KB" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
+              echo "--- Kbuild version block BEFORE bake ($KB) ---"
+              grep -nE 'KSU_GIT_VERSION|KSU_VERSION|KSU_GIT_TAG|30000|FALLBACK' "$KB" || true
+              awk -v cnt="$KSU_CNT" -v tag="$KSU_TAG" '
+                /^# Check if this is a git repository/ && !injected {
+                  print "# --- Kurumi: hardcoded version for hermetic Kleaf build (no .git/network) ---"
+                  print "KSU_GIT_VERSION := " cnt
+                  print "KSU_GIT_TAG := " tag
+                  print "KSU_GIT_VERSION_VALID := 1"
+                  print ""
+                  injected=1
+                }
+                { print }
+              ' "$KB" > "$KB.ktmp" && mv "$KB.ktmp" "$KB"
+              echo "--- Kbuild version block AFTER bake (KSU_GIT_VERSION=$KSU_CNT -> KSU_VERSION=$(expr 30000 + $KSU_CNT), tag=$KSU_TAG) ---"
+              grep -nE 'Kurumi|KSU_GIT_VERSION|KSU_GIT_TAG|KSU_GIT_VERSION_VALID' "$KB" || true
             else
-              echo "WARN: KernelSU-Next Makefile not found or count too small (KMK='$KMK' KSU_CNT='$KSU_CNT') -> version NOT baked; driver may report v0.0.1 again."
+              echo "WARN: KernelSU-Next Kbuild not found or count too small (KB='$KB' KSU_CNT='$KSU_CNT') -> version NOT baked; driver may report v0.0.1 again."
             fi
           fi
 
@@ -688,27 +695,29 @@ jobs:
           [ -f "$AK/anykernel.sh" ] || { echo 'ERROR: anykernel/ framework missing from repo'; exit 1; }
           # All three profile binaries must have been produced by the Rust step above.
           for p in eco balance full; do
-            KB="$AK/kurumi_bin/kurumi_$p"
+            KB="$AK/files/kurumi_bin/kurumi_$p"
             [ -f "$KB" ] || { echo "ERROR: profile binary kurumi_$p missing (Rust build step did not run?)"; exit 1; }
             file "$KB" | grep -q 'ELF' || { echo "ERROR: kurumi_$p is not an ELF binary"; exit 1; }
           done
           # interactive-installer assets must be shipped too
           [ -f "$AK/tools/keycheck" ]       || { echo 'ERROR: tools/keycheck missing'; exit 1; }
           [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
-          [ -f "$AK/kurumi_gpu.dtb" ]       || { echo 'ERROR: kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
+          [ -f "$AK/files/dtb/kurumi_gpu.dtb" ] || { echo 'ERROR: files/dtb/kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
+          [ -f "$AK/files/dtb/stock_gpu.dtb" ] || { echo 'ERROR: files/dtb/stock_gpu.dtb (stock GPU dtb for revert) missing'; exit 1; }
           # drop the freshly built kernel in, replacing any stale image
           # Ship BOTH kernel variants under names AnyKernel will NOT auto-detect; the flash-time
           # menu copies the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a
           # bare Image/Image.gz here or AnyKernel would auto-flash it and bypass the choice.
-          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb "$AK"/kurumi_stock "$AK"/kurumi_ksu "$AK"/kurumi_ksu_susfs
-          cp -v "$KIMG/kurumi_stock" "$AK/kurumi_stock"
-          printf '%s\n' "$IMGNAME" > "$AK/kurumi_imgname"
+          mkdir -p "$AK/files/image"
+          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb "$AK"/files/image/kurumi_stock "$AK"/files/image/kurumi_ksu "$AK"/files/image/kurumi_ksu_susfs
+          cp -v "$KIMG/kurumi_stock" "$AK/files/image/kurumi_stock"
+          printf '%s\n' "$IMGNAME" > "$AK/files/image/kurumi_imgname"
           if [ -f "$KIMG/ksu_ok" ] && [ -f "$KIMG/kurumi_ksu" ]; then
-            cp -v "$KIMG/kurumi_ksu" "$AK/kurumi_ksu"
-            if [ -f "$KIMG/susfs_ok" ]; then echo yes > "$AK/kurumi_ksu_susfs"; else echo no > "$AK/kurumi_ksu_susfs"; fi
-            echo "packaging BOTH variants: stock + KernelSU-Next (susfs=$(cat "$AK/kurumi_ksu_susfs"))"
+            cp -v "$KIMG/kurumi_ksu" "$AK/files/image/kurumi_ksu"
+            if [ -f "$KIMG/susfs_ok" ]; then echo yes > "$AK/files/image/kurumi_ksu_susfs"; else echo no > "$AK/files/image/kurumi_ksu_susfs"; fi
+            echo "packaging BOTH variants: stock + KernelSU-Next (susfs=$(cat "$AK/files/image/kurumi_ksu_susfs"))"
           else
-            rm -f "$AK/kurumi_ksu_susfs"
+            rm -f "$AK/files/image/kurumi_ksu_susfs"
             echo "packaging STOCK ONLY (KSU variant unavailable this run)"
           fi
           # make sure the flasher binaries stay executable inside the zip

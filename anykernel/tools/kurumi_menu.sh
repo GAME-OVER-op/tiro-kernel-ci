@@ -63,7 +63,7 @@ else
 fi;
 
 # ---- 0) Root: KernelSU-Next + susfs (asked only if the KSU image is in the zip) ----
-if [ -f "$home/kurumi_ksu" ]; then
+if [ -f "$home/files/image/kurumi_ksu" ]; then
   ui_print " ";
   ui_print "------------------------------";
   ui_print " Root: install KernelSU-Next?";
@@ -132,18 +132,16 @@ fi;
 # ---- 3) Custom GPU frequency table (binary) ----
 ui_print " ";
 ui_print "------------------------------";
-ui_print " Install custom GPU frequency table?";
-ui_print "   Custom adds 80/120/180 and 916 MHz steps";
-ui_print "   Stock keeps the default range";
-ui_print "   Vol+ = Yes, install custom table";
-ui_print "   Vol- = No, keep stock table";
+ui_print " GPU frequency table (flashed to vendor_boot)";
+ui_print "   Vol+ = Yes - install CUSTOM table (adds 80/120/180 + 916 MHz)";
+ui_print "   Vol- = No  - restore STOCK dtb (revert to stock)";
 ui_print "------------------------------";
 if $FUNCTION; then
   KGPU=1;
-  ui_print " " "   -> Custom GPU table selected";
+  ui_print " " "   -> CUSTOM GPU table -> vendor_boot";
 else
   KGPU=0;
-  ui_print " " "   -> Stock GPU table selected, no changes";
+  ui_print " " "   -> STOCK GPU dtb -> vendor_boot (revert)";
 fi;
 
 rm -f $home/kurumi_events;
