@@ -575,6 +575,34 @@ jobs:
             ksu_rc=1
           fi
 
+          # ---- 2b) BAKE the KSU version into the Makefile (ROOT CAUSE of on-device v0.0.1) ----
+          # KernelSU-Next/kernel/Makefile derives its versionCode at COMPILE time from
+          #   `git rev-list --count HEAD` (needs .git) OR a curl to the GitHub API (needs network).
+          # Kleaf/Bazel compiles inside a HERMETIC sandbox with NEITHER -> the Makefile hits its
+          # fallback and the driver reports v0.0.1 (versionCode too low; the manager rejects it).
+          # The full clone above only fixes the SETUP step, not the compile. So hardcode the real
+          # commit count NOW (git still works here on the runner) and force the .git branch, so the
+          # compile needs no git and no network. Diagnostics print the version block before/after.
+          if [ "$ksu_rc" = 0 ]; then
+            KMK="$(find . -path '*KernelSU-Next/kernel/Makefile' 2>/dev/null | head -1)"
+            if [ -n "$KMK" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
+              echo "--- KSU Makefile version lines BEFORE bake ($KMK) ---"
+              grep -nE 'KSU_GIT_VERSION|KSU_VERSION|rev-list|\.git|curl' "$KMK" || true
+              # force the ".git exists" guard to be true (the sandbox has no .git):
+              sed -i -E 's/test -e [^;]*\.git[^;]*; *echo \$\$\?/echo 0/g' "$KMK"
+              # replace the live git command with the precomputed count (offline-safe):
+              sed -i "s/git rev-list --count HEAD/echo $KSU_CNT/g" "$KMK"
+              # hardcode the version variable outright, whatever its RHS was (git OR curl):
+              sed -i -E "s/(KSU_GIT_VERSION[[:space:]]*:?=[[:space:]]*).*/\\1$KSU_CNT/" "$KMK"
+              # neutralize the unshallow fetch (would fail / stall offline):
+              sed -i 's/git fetch --unshallow/true/g' "$KMK"
+              echo "--- KSU Makefile version lines AFTER bake (expect count=$KSU_CNT, guard forced) ---"
+              grep -nE 'KSU_GIT_VERSION|KSU_VERSION|echo 0|echo '"$KSU_CNT" "$KMK" || true
+            else
+              echo "WARN: KernelSU-Next Makefile not found or count too small (KMK='$KMK' KSU_CNT='$KSU_CNT') -> version NOT baked; driver may report v0.0.1 again."
+            fi
+          fi
+
           # ---- 3) Enable KSU/susfs via Kconfig DEFAULTS, NEVER via gki_defconfig ----
           # LESSON from the previous run: `config KSU` is `default y`, so `make savedefconfig`
           # (the GKI check_defconfig gate that DOES run on common) OMITS it. Writing
