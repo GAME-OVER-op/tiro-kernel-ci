@@ -8,6 +8,15 @@ description = "Kurumi kernel userspace perf/thermal daemon (RedMagic 9 Pro / SM8
 name = "kurumi"
 path = "src/main.rs"
 
+# Battery profiles. CI builds one binary per feature (eco|balance|full) using
+# --no-default-features --features <p>; the flasher installs the selected one.
+# Exactly one must be enabled at a time.
+[features]
+default = ["full"]
+eco = []
+balance = []
+full = []
+
 # Small, self-contained, no external crates (std only) so it cross-compiles to a
 # fully-static aarch64 musl binary that runs on Android bionic with no libc dep.
 [profile.release]

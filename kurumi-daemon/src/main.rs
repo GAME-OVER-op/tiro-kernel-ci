@@ -13,6 +13,8 @@
 //       (stop services -> setprop -> pkill survivors -> zone mode=disabled ->
 //        cooling cur_state=0 -> unbind userspace LMh). Battery zone 74 untouched.
 //     - core_ctl on the big clusters (cpu2/cpu5/cpu7): allow core sleep.
+//     - cpufreq floor/ceiling pinned per cluster to the true HW min/max OPP
+//       (undo powerHAL/perfd raising scaling_min above the hardware minimum).
 //     - vm.max_map_count = 1048576 (headroom for Wine/Winlator emulators).
 //   Event-driven:
 //     - touch-boost: block-read /dev/input/event* in threads (~0 CPU idle);
@@ -20,8 +22,8 @@
 //   Periodic:
 //     - WALT + VM tunables: burst every 60s for the first 20 min (WALT governor
 //       comes up late), then re-assert every 3h (idempotent).
-//     - thermal settings re-check every 10h (idempotent; silently re-applies if
-//       something restored them).
+//     - thermal settings + cpufreq floor re-check every 10h (idempotent;
+//       silently re-applies if something restored them).
 // =====================================================================
 
 use std::fs::{self, File};
@@ -215,6 +217,67 @@ fn apply_memory() {
     write_if_diff("/proc/sys/vm/max_map_count", "1048576");
 }
 
+// ---------- one-time + periodic: cpufreq floor / ceiling ----------
+// On init powerHAL/perfd raises scaling_min_freq one or two OPP steps above the
+// true hardware minimum, which wastes idle power. mora pins each cluster back to
+// its lowest / highest AVAILABLE OPP. Values are hard-coded (KHz) from THIS
+// device's cpufreq tables (RedMagic 9 Pro, SM8650 pineapple); see each policy's
+// scaling_available_frequencies:
+//   policy0 (cpu0-1, little): 364800 .. 2265600
+//   policy2 (cpu2-4, gold):   499200 .. 3148800
+//   policy5 (cpu5-6, gold):   499200 .. 2956800
+//   policy7 (cpu7, prime):    480000 .. 3302400
+// (min, max) per first-cpu policy id. If a table ever changes these become
+// no-ops that just clamp to whatever the node accepts -- never above HW max.
+// Profile is chosen at BUILD time via a cargo feature (eco|balance|full). CI
+// compiles one binary per profile from THIS single source and the flasher
+// installs the one the user picks; ONLY this table differs between them.
+//   little = policy0 (cpu0-1), mid = policy2 (cpu2-4),
+//   big    = policy5 (cpu5-6), prime = policy7 (cpu7).
+// full == true HW min/max on every cluster.
+#[cfg(feature = "full")]
+const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
+    (0, "364800", "2265600"),
+    (2, "499200", "3148800"),
+    (5, "499200", "2956800"),
+    (7, "480000", "3302400"),
+];
+
+// eco: little ceiling ~80%, mid ~70%, big+prime ~40% of HW max (floor = HW min).
+#[cfg(feature = "eco")]
+const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
+    (0, "364800", "1812480"),
+    (2, "499200", "2204160"),
+    (5, "499200", "1182720"),
+    (7, "480000", "1320960"),
+];
+
+// balance: little untouched, mid ~80%, big+prime ~70% of HW max.
+#[cfg(feature = "balance")]
+const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
+    (0, "364800", "2265600"),
+    (2, "499200", "2519040"),
+    (5, "499200", "2069760"),
+    (7, "480000", "2311680"),
+];
+
+// Refuse to build a daemon with no profile selected.
+#[cfg(not(any(feature = "eco", feature = "balance", feature = "full")))]
+compile_error!("select exactly one profile feature: eco | balance | full");
+
+fn apply_cpufreq_limits() {
+    for &(policy, min, max) in CPUFREQ_LIMITS {
+        let base = format!("/sys/devices/system/cpu/cpufreq/policy{}", policy);
+        if !Path::new(&base).exists() {
+            continue;
+        }
+        // Raise the ceiling before lowering the floor so scaling_min can never
+        // transiently exceed scaling_max (kernel rejects that write).
+        write_if_diff(format!("{}/scaling_max_freq", base), max);
+        write_if_diff(format!("{}/scaling_min_freq", base), min);
+    }
+}
+
 // ---------- periodic: WALT cpufreq smoothing + VM ----------
 
 fn apply_walt_vm() {
@@ -299,6 +362,7 @@ fn main() {
     thread::sleep(Duration::from_secs(BOOT_WAIT_SECS));
     disable_thermal_services();
     apply_core_ctl();
+    apply_cpufreq_limits();
     apply_memory();
 
     // Burst: re-assert WALT/VM every 60s for the first 20 min (WALT governor is
@@ -325,6 +389,7 @@ fn main() {
         }
         if therm_acc >= THERMAL_RECHECK_SECS {
             disable_thermal_services();
+            apply_cpufreq_limits();
             therm_acc = 0;
         }
     }
