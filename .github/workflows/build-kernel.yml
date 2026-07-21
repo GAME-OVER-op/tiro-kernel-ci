@@ -557,21 +557,31 @@ jobs:
           ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next )
           ksu_rc=$?
 
-          # ---- 3) Enable configs IN-PLACE in common gki_defconfig -- the proven path used for
-          #        CONFIG_IP6_NF_NAT (the real Kleaf build runs olddefconfig on common; no byte gate). ----
-          add_cfg(){ grep -q "^$1=y" "$CDEF" || echo "$1=y" >> "$CDEF"; }
+          # ---- 3) Enable KSU/susfs via Kconfig DEFAULTS, NEVER via gki_defconfig ----
+          # LESSON from the previous run: `config KSU` is `default y`, so `make savedefconfig`
+          # (the GKI check_defconfig gate that DOES run on common) OMITS it. Writing
+          # `CONFIG_KSU=y` into gki_defconfig makes the checked-in file differ from savedefconfig:
+          #   "ERROR: savedefconfig does not match ... -CONFIG_KSU=y".
+          # (IP6_NF_NAT survived only because it is a NON-default symbol that savedefconfig
+          # re-emits in its canonical slot.) So leave gki_defconfig BYTE-IDENTICAL to the stock
+          # tree (which passes the gate); KSU compiles in from its own default-y Kconfig, and the
+          # post-build check below still confirms CONFIG_KSU=y landed in the Image. For susfs,
+          # flip its Kconfig `default n`->`default y` (source edit, allowed) so those options are
+          # on WITHOUT any gki_defconfig line either. $CDEF is intentionally left untouched here.
           if [ "$ksu_rc" = 0 ]; then
-            add_cfg CONFIG_KSU
             if [ -f "$GITHUB_WORKSPACE/kimg/susfs_ok" ]; then
-              add_cfg CONFIG_KSU_SUSFS
-              for c in SUS_PATH SUS_MOUNT TRY_UMOUNT AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT SUS_KSTAT SUS_OVERLAYFS SUS_SU SPOOF_UNAME ENABLE_LOG; do
-                add_cfg "CONFIG_KSU_SUSFS_$c"
+              KSUD="$(find . -maxdepth 4 -type d -name 'KernelSU-Next' | head -1)"
+              for kc in $(grep -rlE 'config[[:space:]]+KSU_SUSFS' common "$KSUD" 2>/dev/null); do
+                echo "susfs: flipping defaults to y in $kc"
+                awk '
+                  /^[[:space:]]*config[[:space:]]+KSU_SUSFS/ {blk=1}
+                  /^[[:space:]]*config[[:space:]]/ && $0 !~ /KSU_SUSFS/ {blk=0}
+                  { if (blk && $0 ~ /^[[:space:]]*default[[:space:]]+n[[:space:]]*$/) sub(/default[[:space:]]+n/,"default y"); print }
+                ' "$kc" > "$kc.ktmp" && mv "$kc.ktmp" "$kc"
               done
             fi
-            # susfs/KSU symbol churn can trip the GKI protected-exports check; drop the lists.
-            rm -f common/android/abi_gki_protected_exports_* 2>/dev/null
             echo ok > "$GITHUB_WORKSPACE/kimg/ksu_ok"
-            echo "--- common gki_defconfig KSU lines: ---"; grep -nE '^CONFIG_KSU' "$CDEF" || true
+            echo "gki_defconfig left byte-identical to stock (KSU is default-y in Kconfig) -> no savedefconfig gate risk."
             if [ -f "$GITHUB_WORKSPACE/kimg/susfs_ok" ]; then
               echo "KSU + susfs integration OK -> building variant 2 (root + susfs)."
             else
