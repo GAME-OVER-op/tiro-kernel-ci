@@ -50,19 +50,29 @@ apply_selinux() {
   fi;
 }
 
-## Stash overlay.d before any reset wipes the shipped ramdisk dir
-if [ -d "$home/ramdisk/overlay.d" ]; then
-  cp -rf "$home/ramdisk/overlay.d" "$home/kurumi_overlay";
-fi;
-
-## Install the selected CPU-profile binary as the daemon (kurumi_battery).
-## CI ships all three in kurumi_bin/; init.kurumi.rc launches kurumi_battery.
-mkdir -p "$home/kurumi_overlay/sbin";
-if [ -f "$home/kurumi_bin/kurumi_$KPROFILE" ]; then
-  cp -f "$home/kurumi_bin/kurumi_$KPROFILE" "$home/kurumi_overlay/sbin/kurumi_battery";
-  ui_print " " "Kurumi: staged '$KPROFILE' battery profile";
+## Battery daemon (overlay.d). If the user picked 'Skip' in the profile menu we install
+## NOTHING (no kurumi_overlay -> install_overlayd is a no-op and the init_boot overlay pass
+## is skipped). Otherwise the overlay is baked into init_boot UNCONDITIONALLY: it only runs
+## under Magisk (magiskinit imports overlay.d); on KSU/APatch/no-root it stays dormant and
+## harmless (stock init ignores /overlay.d), so it cannot break boot.
+if [ "$KPROFILE" = "skip" ]; then
+  rm -rf "$home/kurumi_overlay";
+  ui_print " " "Kurumi: battery daemon skipped (no overlay installed)";
 else
-  ui_print " " "WARNING: kurumi_$KPROFILE not found - battery daemon will NOT be installed";
+  ## Stash overlay.d before any reset wipes the shipped ramdisk dir
+  if [ -d "$home/ramdisk/overlay.d" ]; then
+    cp -rf "$home/ramdisk/overlay.d" "$home/kurumi_overlay";
+  fi;
+  ## Install the selected CPU-profile binary as the daemon (kurumi_battery).
+  ## CI ships all three in kurumi_bin/; init.kurumi.rc launches kurumi_battery.
+  mkdir -p "$home/kurumi_overlay/sbin";
+  if [ -f "$home/kurumi_bin/kurumi_$KPROFILE" ]; then
+    cp -f "$home/kurumi_bin/kurumi_$KPROFILE" "$home/kurumi_overlay/sbin/kurumi_battery";
+    ui_print " " "Kurumi: staged '$KPROFILE' battery profile (active only on Magisk)";
+  else
+    ui_print " " "WARNING: kurumi_$KPROFILE not found - battery daemon will NOT be installed";
+    rm -rf "$home/kurumi_overlay";
+  fi;
 fi;
 
 ## GPU: on 'yes', stage the custom dtb as $home/dtb so flash_boot injects it into

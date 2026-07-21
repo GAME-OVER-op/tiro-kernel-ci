@@ -554,8 +554,26 @@ jobs:
 
           # ---- 2) KernelSU-Next (next). Do NOT apply susfs4ksu's 10_enable_*.patch: it targets
           #        LEGACY KernelSU and corrupts KSU-Next (the 'next' branch integrates susfs itself). ----
+          # FIX for the on-device "KernelSU-Next 1 too old / update to >= 33188" manager error:
+          # the KSU driver version is derived from `git rev-list --count HEAD` of the KernelSU-Next
+          # checkout (kernel/Makefile). The bare `curl|bash -s next` path left a shallow/half
+          # checkout (see the earlier harmless-looking "pathspec 'next' did not match"), so the
+          # count failed and the driver reported the v0.0.1 fallback (versionCode 1) that current
+          # managers reject. FIX: pre-clone KernelSU-Next with FULL history on `next` INTO common/
+          # so setup.sh reuses it as-is and the version resolves to the real, current number.
+          ( cd common && rm -rf KernelSU-Next \
+              && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
+              && ( cd KernelSU-Next && (git checkout next || git checkout -b next origin/next) ) )
+          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
+          echo "KernelSU-Next 'next' commit count (drives KSU_VERSION): $KSU_CNT"
           ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next )
           ksu_rc=$?
+          # Guard: never ship the broken v0.0.1 fallback again. A real 'next' checkout has
+          # thousands of commits; a tiny count means the version calc fell back -> skip KSU.
+          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
+            echo "WARN: KSU-Next history too shallow ($KSU_CNT) -> driver would report v0.0.1 and the manager would reject it. Skipping KSU this run."
+            ksu_rc=1
+          fi
 
           # ---- 3) Enable KSU/susfs via Kconfig DEFAULTS, NEVER via gki_defconfig ----
           # LESSON from the previous run: `config KSU` is `default y`, so `make savedefconfig`
