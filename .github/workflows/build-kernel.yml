@@ -518,40 +518,69 @@ jobs:
       - name: Integrate KernelSU-Next + susfs (variant 2 prep, non-fatal)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
-          # BEST-EFFORT. The stock Image is already built and stashed, so nothing here can
-          # regress the working kernel. If integration fails we skip variant 2 and the zip
-          # ships stock-only. susfs patches kernel C source (explicitly accepted for this feature).
+          # BEST-EFFORT + DECOUPLED. The stock Image is already built + stashed, so nothing here can
+          # regress it. Order: (1) get a working KernelSU (root) image; (2) add susfs ON TOP only if
+          # its kernel patch applies cleanly. If susfs fails we revert ONLY susfs's own files (our
+          # other customizations are untouched) and still ship a KSU(root) image, and dump the .rej.
           set +e
           set -x
-          rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
-          ksu_rc=1; sus_rc=1
-          # 1) KernelSU-Next (next branch) into the GKI kernel (common/ = the tree the flashed Image is built from).
-          #    CONFIG_KSU defaults y from the driver Kconfig, so we do NOT touch common gki_defconfig
-          #    (adding lines there fails the strict GKI check_defconfig savedefconfig gate).
-          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next )
-          ksu_rc=$?
-          # 2) susfs4ksu -- branch MUST match the kernel line (gki-android14-6.1).
+          rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok" "$GITHUB_WORKSPACE/kimg/susfs_ok"
+          CDEF=common/arch/arm64/configs/gki_defconfig
+
+          # ---- 1) susfs KERNEL-side FIRST (clean revert if it fails) ----
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1
           SUS="$PWD/susfs4ksu/kernel_patches"
+          SUS_PATCH="$SUS/50_add_susfs_in_gki-android14-6.1.patch"
+          # files the patch modifies -> used for a PRECISE revert that preserves our other edits
+          PT="$(grep -E '^\+\+\+ ' "$SUS_PATCH" | awk '{print $2}' | sed -E 's#^b/##' | grep -vE '^/dev/null')"
           cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
           cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
-          ( cd common && patch -p1 < "$SUS/50_add_susfs_in_gki-android14-6.1.patch" )
-          sus_rc=$?
-          # 3) KSU-side susfs enable patch (tolerant -- recent KSU-Next may already bundle susfs).
-          KSUD="$(find . -maxdepth 3 -type d -name 'KernelSU-Next' | head -1)"
-          if [ -n "$KSUD" ] && [ -f "$SUS/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-            ( cd "$KSUD" && patch -p1 < "$SUS/KernelSU/10_enable_susfs_for_ksu.patch" ) \
-              || echo "WARN: KSU-side susfs patch did not apply cleanly (likely already integrated) - continuing"
-          fi
-          # 4) Drop GKI protected-export lists so susfs symbol changes do not trip the ABI gate.
-          rm -f common/android/abi_gki_protected_exports_* 2>/dev/null
-          set +x
-          if [ "$ksu_rc" = 0 ] && [ "$sus_rc" = 0 ]; then
-            echo ok > "$GITHUB_WORKSPACE/kimg/ksu_ok"
-            echo "KSU + susfs integration OK - will build variant 2."
+          ( cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_PATCH" )
+          REJ="$(cd common && find . -name '*.rej' 2>/dev/null)"
+          if [ -n "$REJ" ]; then
+            echo '=================== susfs .rej DUMP (send this to fix susfs next run) ==================='
+            for r in $REJ; do echo "----- common/$r -----"; sed -n '1,120p' "common/$r"; done
+            echo '========================================================================================'
+            echo "WARN: susfs kernel patch did NOT apply cleanly -> reverting susfs, shipping KSU (root) WITHOUT susfs this run."
+            for f in $PT; do git -C common checkout -- "$f" 2>/dev/null || true; done
+            for f in "$SUS"/fs/* "$SUS"/include/linux/*; do
+              rm -f "common/fs/$(basename "$f")" "common/include/linux/$(basename "$f")" 2>/dev/null
+            done
+            ( cd common && find . -name '*.rej' -delete; find . -name '*.orig' -delete ) 2>/dev/null
           else
-            echo "WARN: KSU/susfs integration failed (ksu_rc=$ksu_rc sus_rc=$sus_rc) - zip ships STOCK only."
+            echo susfs > "$GITHUB_WORKSPACE/kimg/susfs_ok"
+            echo "OK: susfs kernel-side applied cleanly."
           fi
+
+          # ---- 2) KernelSU-Next (next). Do NOT apply susfs4ksu's 10_enable_*.patch: it targets
+          #        LEGACY KernelSU and corrupts KSU-Next (the 'next' branch integrates susfs itself). ----
+          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next )
+          ksu_rc=$?
+
+          # ---- 3) Enable configs IN-PLACE in common gki_defconfig -- the proven path used for
+          #        CONFIG_IP6_NF_NAT (the real Kleaf build runs olddefconfig on common; no byte gate). ----
+          add_cfg(){ grep -q "^$1=y" "$CDEF" || echo "$1=y" >> "$CDEF"; }
+          if [ "$ksu_rc" = 0 ]; then
+            add_cfg CONFIG_KSU
+            if [ -f "$GITHUB_WORKSPACE/kimg/susfs_ok" ]; then
+              add_cfg CONFIG_KSU_SUSFS
+              for c in SUS_PATH SUS_MOUNT TRY_UMOUNT AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT SUS_KSTAT SUS_OVERLAYFS SUS_SU SPOOF_UNAME ENABLE_LOG; do
+                add_cfg "CONFIG_KSU_SUSFS_$c"
+              done
+            fi
+            # susfs/KSU symbol churn can trip the GKI protected-exports check; drop the lists.
+            rm -f common/android/abi_gki_protected_exports_* 2>/dev/null
+            echo ok > "$GITHUB_WORKSPACE/kimg/ksu_ok"
+            echo "--- common gki_defconfig KSU lines: ---"; grep -nE '^CONFIG_KSU' "$CDEF" || true
+            if [ -f "$GITHUB_WORKSPACE/kimg/susfs_ok" ]; then
+              echo "KSU + susfs integration OK -> building variant 2 (root + susfs)."
+            else
+              echo "KSU (root) integration OK, susfs skipped -> building variant 2 (root only)."
+            fi
+          else
+            echo "WARN: KernelSU-Next setup failed (ksu_rc=$ksu_rc) - zip ships STOCK only."
+          fi
+          set +x
           exit 0
 
       - name: Build kernel (KernelSU variant, non-fatal)
@@ -615,13 +644,15 @@ jobs:
           # Ship BOTH kernel variants under names AnyKernel will NOT auto-detect; the flash-time
           # menu copies the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a
           # bare Image/Image.gz here or AnyKernel would auto-flash it and bypass the choice.
-          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb "$AK"/kurumi_stock "$AK"/kurumi_ksu
+          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb "$AK"/kurumi_stock "$AK"/kurumi_ksu "$AK"/kurumi_ksu_susfs
           cp -v "$KIMG/kurumi_stock" "$AK/kurumi_stock"
           printf '%s\n' "$IMGNAME" > "$AK/kurumi_imgname"
           if [ -f "$KIMG/ksu_ok" ] && [ -f "$KIMG/kurumi_ksu" ]; then
             cp -v "$KIMG/kurumi_ksu" "$AK/kurumi_ksu"
-            echo "packaging BOTH variants: stock + KernelSU-Next (susfs)"
+            if [ -f "$KIMG/susfs_ok" ]; then echo yes > "$AK/kurumi_ksu_susfs"; else echo no > "$AK/kurumi_ksu_susfs"; fi
+            echo "packaging BOTH variants: stock + KernelSU-Next (susfs=$(cat "$AK/kurumi_ksu_susfs"))"
           else
+            rm -f "$AK/kurumi_ksu_susfs"
             echo "packaging STOCK ONLY (KSU variant unavailable this run)"
           fi
           # make sure the flasher binaries stay executable inside the zip

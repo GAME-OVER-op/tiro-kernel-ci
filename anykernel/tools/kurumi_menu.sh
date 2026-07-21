@@ -66,7 +66,8 @@ fi;
 if [ -f "$home/kurumi_ksu" ]; then
   ui_print " ";
   ui_print "------------------------------";
-  ui_print " Root: KernelSU-Next + susfs?";
+  ui_print " Root: install KernelSU-Next?";
+  ui_print "   (KSU-Next; susfs if built this release)";
   ui_print "   Vol+ = Yes  (install KSU kernel)";
   ui_print "   Vol- = No   (clean stock kernel)";
   ui_print "------------------------------";

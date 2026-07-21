@@ -83,7 +83,8 @@ IMGNAME="Image.gz";
 KSEL="";
 if [ "$KKSU" = "1" ] && [ -f "$home/kurumi_ksu" ]; then
   KSEL="$home/kurumi_ksu";
-  ui_print " " "Kurumi: flashing KernelSU-Next + susfs kernel";
+  _susfs=no; [ -f "$home/kurumi_ksu_susfs" ] && _susfs="$(cat "$home/kurumi_ksu_susfs")";
+  ui_print " " "Kurumi: flashing KernelSU-Next kernel (susfs: $_susfs)";
 elif [ -f "$home/kurumi_stock" ]; then
   KSEL="$home/kurumi_stock";
   ui_print " " "Kurumi: flashing stock (no-root) kernel";
@@ -91,7 +92,7 @@ fi;
 if [ -n "$KSEL" ]; then
   cp -f "$KSEL" "$home/$IMGNAME";
 fi;
-rm -f "$home/kurumi_stock" "$home/kurumi_ksu";
+rm -f "$home/kurumi_stock" "$home/kurumi_ksu" "$home/kurumi_ksu_susfs";
 
 if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" ] || [ -e "/dev/block/by-name/init_boot$slot" ] || [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
   ## ---- GKI: kernel (+ optional GPU dtb) in boot, ramdisk (Magisk + overlay.d) in init_boot ----
