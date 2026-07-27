@@ -10,6 +10,23 @@ Pro)** - Snapdragon 8 Gen 3 / SM8650 "pineapple", Linux 6.1, LineageOS 23.2.
 | `.github/workflows/build-kernel.yml` | Kernel only + `Kurumi_kernel_build<N>.zip` | `tiro-kernel` |
 | `.github/workflows/build-rom.yml` | Full LineageOS 23.2 ROM | `tiro-rom` |
 
+
+## Current build plan
+
+Kernel workflow now treats the Google GKI base as a moving `android14-6.1` branch instead of pinning comments/checks to one sublevel. The diagnostic check expects the neutral pattern:
+
+```text
+6.1.*-android14-11-kurumi-dev-GAME-OVER-op
+```
+
+The flashable AnyKernel package can ship up to three real kernel images and shows them in a volume-key scrolling menu:
+
+1. `Stock` - no root.
+2. `KernelSU` - KernelSU-Next only.
+3. `KSU + susfs` - KernelSU-Next plus susfs, only shown when that image actually built and passed `CONFIG_KSU_SUSFS=y` verification.
+
+Vol Down moves the cursor; Vol Up selects, matching the Rust profile selector.
+
 ## In-kernel battery tweak (overlay.d)
 The battery tuning ships inside the kernel flash - no separate Magisk module.
 `anykernel/ramdisk/overlay.d/` is injected into the device ramdisk (`init_boot`

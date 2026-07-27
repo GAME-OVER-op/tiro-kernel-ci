@@ -28,6 +28,12 @@ jobs:
       # --- pristine AOSP GKI common (matches the device's stock/LineageOS android14-6.1 LTS) ---
       GKI_COMMON_REPO: https://android.googlesource.com/kernel/common
       GKI_COMMON_BRANCH: android14-6.1
+      # --- root variants ---
+      # Keep plain KSU on the fast-moving next branch. For susfs, use the KSU-Next legacy
+      # integration path and apply susfs4ksu's KSU-side + common-side patches explicitly.
+      KSU_NEXT_REF: next
+      KSU_SUSFS_REF: legacy
+      SUSFS_BRANCH: gki-android14-6.1
       # --- nubia overlay sources ---
       NUBIA_KERNEL_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650.git
       NUBIA_DTS_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650-devicetrees.git
@@ -259,7 +265,7 @@ jobs:
           # runs a KMI/sublevel consistency check vs msm-kernel (which stays -android14-11), and a
           # release WITHOUT the marker fails the build ("KMI or sublevel mismatch" + "not a valid
           # GKI version", and it also breaks the system_dlkm image). So we emit -android14-11-<name>:
-          #   uname -r = 6.1.174-android14-11-kurumi-dev-GAME-OVER-op
+          #   uname -r = 6.1.x-android14-11-kurumi-dev-GAME-OVER-op
           # Only common is patched; msm-kernel keeps its native -android14-11-o-maybe-dirty, so both
           # carry KMI android14-11 and the check passes (the 173-vs-174 sublevel diff is tolerated,
           # exactly as in the prior booting builds). NOTE: the name is non-ASCII (Japanese) -- a
@@ -441,7 +447,7 @@ jobs:
             --action_env=KBUILD_BUILD_HOST \
             --action_env=KBUILD_BUILD_TIMESTAMP
 
-      - name: Stash stock kernel Image (variant 1 of 2)
+      - name: Stash stock kernel Image (variant 1 of 3)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
           set -e
@@ -476,8 +482,8 @@ jobs:
               echo 'WARN: no kernel.release or Image found to read version from'
             fi
           fi
-          echo '=== expected: 6.1.174-android14-11-kurumi-dev-GAME-OVER-op ==='
-          echo '=== if a trailing -android14-11 appears, tell me; I will add --nokleaf_localversion ==='
+          echo '=== expected pattern: 6.1.*-android14-11-kurumi-dev-GAME-OVER-op ==='
+          echo '=== moving GKI base is OK as long as KMI marker/localversion stay correct ==='
           exit 0
 
       - name: Verify MODULE_SIG_PROTECT is OFF in the built kernel
@@ -515,78 +521,30 @@ jobs:
             exit 1
           fi
 
-      - name: Integrate KernelSU-Next + susfs (variant 2 prep, non-fatal)
+      - name: Mark common source baseline for root variants
         working-directory: /mnt/src/kp/kernel_platform
         run: |
-          # BEST-EFFORT + DECOUPLED. The stock Image is already built + stashed, so nothing here can
-          # regress it. Order: (1) get a working KernelSU (root) image; (2) add susfs ON TOP only if
-          # its kernel patch applies cleanly. If susfs fails we revert ONLY susfs's own files (our
-          # other customizations are untouched) and still ship a KSU(root) image, and dump the .rej.
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/kimg"
+          # Snapshot the already-patched common tree after the stock build. Root variants are built
+          # from this exact baseline so stock, KSU, and KSU+susfs differ only by root/susfs code.
+          git -C common add -A
+          git -C common commit -m "kurumi base before root variants" || true
+          git -C common rev-parse HEAD > "$GITHUB_WORKSPACE/kimg/common_base_commit"
+          echo "common baseline: $(cat "$GITHUB_WORKSPACE/kimg/common_base_commit")"
+
+      - name: Integrate KernelSU-Next only (variant 2 prep, non-fatal)
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
           set +e
           set -x
-          rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok" "$GITHUB_WORKSPACE/kimg/susfs_ok"
-          CDEF=common/arch/arm64/configs/gki_defconfig
+          rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
+          BASE="$(cat "$GITHUB_WORKSPACE/kimg/common_base_commit" 2>/dev/null)"
+          [ -n "$BASE" ] || { echo "WARN: common baseline missing - skipping KSU variant"; exit 0; }
+          git -C common reset --hard "$BASE"
+          git -C common clean -ffd
 
-          # ---- 1) susfs KERNEL-side FIRST (clean revert if it fails) ----
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1
-          SUS="$PWD/susfs4ksu/kernel_patches"
-          SUS_PATCH="$SUS/50_add_susfs_in_gki-android14-6.1.patch"
-          # files the patch modifies -> used for a PRECISE revert that preserves our other edits
-          PT="$(grep -E '^\+\+\+ ' "$SUS_PATCH" | awk '{print $2}' | sed -E 's#^b/##' | grep -vE '^/dev/null')"
-          cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
-          cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
-          ( cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_PATCH" )
-          REJ="$(cd common && find . -name '*.rej' 2>/dev/null)"
-          if [ -n "$REJ" ]; then
-            echo '=================== susfs .rej DUMP (send this to fix susfs next run) ==================='
-            for r in $REJ; do echo "----- common/$r -----"; sed -n '1,120p' "common/$r"; done
-            echo '========================================================================================'
-            echo "WARN: susfs kernel patch did NOT apply cleanly -> reverting susfs, shipping KSU (root) WITHOUT susfs this run."
-            for f in $PT; do git -C common checkout -- "$f" 2>/dev/null || true; done
-            for f in "$SUS"/fs/* "$SUS"/include/linux/*; do
-              rm -f "common/fs/$(basename "$f")" "common/include/linux/$(basename "$f")" 2>/dev/null
-            done
-            ( cd common && find . -name '*.rej' -delete; find . -name '*.orig' -delete ) 2>/dev/null
-          else
-            echo susfs > "$GITHUB_WORKSPACE/kimg/susfs_ok"
-            echo "OK: susfs kernel-side applied cleanly."
-          fi
-
-          # ---- 2) KernelSU-Next (next). Do NOT apply susfs4ksu's 10_enable_*.patch: it targets
-          #        LEGACY KernelSU and corrupts KSU-Next (the 'next' branch integrates susfs itself). ----
-          # FIX for the on-device "KernelSU-Next 1 too old / update to >= 33188" manager error:
-          # the KSU driver version is derived from `git rev-list --count HEAD` of the KernelSU-Next
-          # checkout (kernel/Makefile). The bare `curl|bash -s next` path left a shallow/half
-          # checkout (see the earlier harmless-looking "pathspec 'next' did not match"), so the
-          # count failed and the driver reported the v0.0.1 fallback (versionCode 1) that current
-          # managers reject. FIX: pre-clone KernelSU-Next with FULL history on `next` INTO common/
-          # so setup.sh reuses it as-is and the version resolves to the real, current number.
-          ( cd common && rm -rf KernelSU-Next \
-              && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
-              && ( cd KernelSU-Next && (git checkout next || git checkout -b next origin/next) ) )
-          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
-          echo "KernelSU-Next 'next' commit count (drives KSU_VERSION): $KSU_CNT"
-          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next )
-          ksu_rc=$?
-          # Guard: never ship the broken v0.0.1 fallback again. A real 'next' checkout has
-          # thousands of commits; a tiny count means the version calc fell back -> skip KSU.
-          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
-            echo "WARN: KSU-Next history too shallow ($KSU_CNT) -> driver would report v0.0.1 and the manager would reject it. Skipping KSU this run."
-            ksu_rc=1
-          fi
-
-          # ---- 2b) BAKE the KSU version into kernel/Kbuild (ROOT CAUSE of on-device v0.0.1) ----
-          # PROVEN from the KernelSU-Next source (kernel/Kbuild, NOT kernel/Makefile): the
-          #   versionCode is  KSU_VERSION = 30000 + $(git rev-list --count HEAD)  and is guarded by
-          #   KSU_GIT_VERSION_VALID, which is set ONLY when a .git repo is detected via
-          #   `git rev-parse --show-toplevel`. Under the Kleaf/Bazel HERMETIC sandbox there is no
-          #   .git and no network, so that guard stays unset and Kbuild falls back to
-          #   -DKSU_VERSION=1 / tag v0.0.1 -> the manager rejects it. (My earlier Makefile patch
-          #   touched the wrong file, hence "still v0.0.1".)
-          # FIX: compute the real commit count + tag NOW (git works on the runner) and inject them
-          #   as UNCONDITIONAL defs at the top of Kbuild, so the compile needs neither git nor
-          #   network and reports the true version (30000 + count).
-          if [ "$ksu_rc" = 0 ]; then
+          bake_ksu_version() {
             KB="$(find . -path '*KernelSU-Next/kernel/Kbuild' 2>/dev/null | head -1)"
             KSU_TAG="$(cd common/KernelSU-Next 2>/dev/null && git describe --tags --abbrev=0 2>/dev/null || echo v1.0.0)"
             if [ -n "$KB" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
@@ -606,42 +564,27 @@ jobs:
               echo "--- Kbuild version block AFTER bake (KSU_GIT_VERSION=$KSU_CNT -> KSU_VERSION=$(expr 30000 + $KSU_CNT), tag=$KSU_TAG) ---"
               grep -nE 'Kurumi|KSU_GIT_VERSION|KSU_GIT_TAG|KSU_GIT_VERSION_VALID' "$KB" || true
             else
-              echo "WARN: KernelSU-Next Kbuild not found or count too small (KB='$KB' KSU_CNT='$KSU_CNT') -> version NOT baked; driver may report v0.0.1 again."
+              echo "WARN: KernelSU-Next Kbuild not found or count too small (KB='$KB' KSU_CNT='$KSU_CNT') -> version NOT baked."
             fi
-          fi
+          }
 
-          # ---- 3) Enable KSU/susfs via Kconfig DEFAULTS, NEVER via gki_defconfig ----
-          # LESSON from the previous run: `config KSU` is `default y`, so `make savedefconfig`
-          # (the GKI check_defconfig gate that DOES run on common) OMITS it. Writing
-          # `CONFIG_KSU=y` into gki_defconfig makes the checked-in file differ from savedefconfig:
-          #   "ERROR: savedefconfig does not match ... -CONFIG_KSU=y".
-          # (IP6_NF_NAT survived only because it is a NON-default symbol that savedefconfig
-          # re-emits in its canonical slot.) So leave gki_defconfig BYTE-IDENTICAL to the stock
-          # tree (which passes the gate); KSU compiles in from its own default-y Kconfig, and the
-          # post-build check below still confirms CONFIG_KSU=y landed in the Image. For susfs,
-          # flip its Kconfig `default n`->`default y` (source edit, allowed) so those options are
-          # on WITHOUT any gki_defconfig line either. $CDEF is intentionally left untouched here.
+          ( cd common && rm -rf KernelSU-Next \
+              && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
+              && ( cd KernelSU-Next && (git checkout "$KSU_NEXT_REF" || git checkout -b "$KSU_NEXT_REF" "origin/$KSU_NEXT_REF") ) )
+          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
+          echo "KernelSU-Next '$KSU_NEXT_REF' commit count (drives KSU_VERSION): $KSU_CNT"
+          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_NEXT_REF" )
+          ksu_rc=$?
+          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
+            echo "WARN: KSU-Next history too shallow ($KSU_CNT) -> driver would report v0.0.1. Skipping KSU variant."
+            ksu_rc=1
+          fi
           if [ "$ksu_rc" = 0 ]; then
-            if [ -f "$GITHUB_WORKSPACE/kimg/susfs_ok" ]; then
-              KSUD="$(find . -maxdepth 4 -type d -name 'KernelSU-Next' | head -1)"
-              for kc in $(grep -rlE 'config[[:space:]]+KSU_SUSFS' common "$KSUD" 2>/dev/null); do
-                echo "susfs: flipping defaults to y in $kc"
-                awk '
-                  /^[[:space:]]*config[[:space:]]+KSU_SUSFS/ {blk=1}
-                  /^[[:space:]]*config[[:space:]]/ && $0 !~ /KSU_SUSFS/ {blk=0}
-                  { if (blk && $0 ~ /^[[:space:]]*default[[:space:]]+n[[:space:]]*$/) sub(/default[[:space:]]+n/,"default y"); print }
-                ' "$kc" > "$kc.ktmp" && mv "$kc.ktmp" "$kc"
-              done
-            fi
+            bake_ksu_version
             echo ok > "$GITHUB_WORKSPACE/kimg/ksu_ok"
-            echo "gki_defconfig left byte-identical to stock (KSU is default-y in Kconfig) -> no savedefconfig gate risk."
-            if [ -f "$GITHUB_WORKSPACE/kimg/susfs_ok" ]; then
-              echo "KSU + susfs integration OK -> building variant 2 (root + susfs)."
-            else
-              echo "KSU (root) integration OK, susfs skipped -> building variant 2 (root only)."
-            fi
+            echo "KSU-only integration OK -> building variant 2."
           else
-            echo "WARN: KernelSU-Next setup failed (ksu_rc=$ksu_rc) - zip ships STOCK only."
+            echo "WARN: KernelSU-Next setup failed (ksu_rc=$ksu_rc) - KSU-only variant skipped."
           fi
           set +x
           exit 0
@@ -663,7 +606,7 @@ jobs:
             --action_env=KBUILD_BUILD_TIMESTAMP
           rc=$?
           if [ $rc -ne 0 ]; then
-            echo "WARN: KSU variant build failed (rc=$rc) - zip ships STOCK only."
+            echo "WARN: KSU variant build failed (rc=$rc) - KSU-only variant skipped."
             rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0
           fi
           DIST=out/msm-kernel-pineapple-gki/dist
@@ -671,11 +614,160 @@ jobs:
           IMG=""
           for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
           [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
-          if [ -z "$IMG" ]; then echo 'WARN: KSU Image not found post-build - shipping STOCK only'; rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0; fi
+          if [ -z "$IMG" ]; then echo 'WARN: KSU Image not found post-build - KSU-only variant skipped'; rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0; fi
           CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
-          echo "$CFG" | grep -E '^CONFIG_KSU=y' && echo 'OK: CONFIG_KSU=y baked into KSU Image' || echo 'WARN: CONFIG_KSU=y not detected in KSU Image config'
-          cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu"
-          echo "stashed KSU image: $IMG -> kimg/kurumi_ksu"
+          if echo "$CFG" | grep -q '^CONFIG_KSU=y'; then
+            echo 'OK: CONFIG_KSU=y baked into KSU Image'
+            cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu"
+            echo "stashed KSU image: $IMG -> kimg/kurumi_ksu"
+          else
+            echo 'WARN: CONFIG_KSU=y not detected in KSU Image config - KSU-only variant skipped'
+            rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
+          fi
+
+      - name: Integrate KernelSU-Next + susfs (variant 3 prep, non-fatal)
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set +e
+          set -x
+          rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
+          BASE="$(cat "$GITHUB_WORKSPACE/kimg/common_base_commit" 2>/dev/null)"
+          [ -n "$BASE" ] || { echo "WARN: common baseline missing - skipping KSU+susfs variant"; exit 0; }
+          git -C common reset --hard "$BASE"
+          git -C common clean -ffd
+
+          bake_ksu_version() {
+            KB="$(find . -path '*KernelSU-Next/kernel/Kbuild' 2>/dev/null | head -1)"
+            KSU_TAG="$(cd common/KernelSU-Next 2>/dev/null && git describe --tags --abbrev=0 2>/dev/null || echo v1.0.0)"
+            if [ -n "$KB" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
+              awk -v cnt="$KSU_CNT" -v tag="$KSU_TAG" '
+                /^# Check if this is a git repository/ && !injected {
+                  print "# --- Kurumi: hardcoded version for hermetic Kleaf build (no .git/network) ---"
+                  print "KSU_GIT_VERSION := " cnt
+                  print "KSU_GIT_TAG := " tag
+                  print "KSU_GIT_VERSION_VALID := 1"
+                  print ""
+                  injected=1
+                }
+                { print }
+              ' "$KB" > "$KB.ktmp" && mv "$KB.ktmp" "$KB"
+              grep -nE 'Kurumi|KSU_GIT_VERSION|KSU_GIT_TAG|KSU_GIT_VERSION_VALID' "$KB" || true
+            else
+              echo "WARN: KernelSU-Next Kbuild not found or count too small (KB='$KB' KSU_CNT='$KSU_CNT') -> version NOT baked."
+            fi
+          }
+
+          # 1) Add susfs to the GKI common tree.
+          rm -rf susfs4ksu
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
+          SUS="$PWD/susfs4ksu/kernel_patches"
+          SUS_PATCH="$SUS/50_add_susfs_in_gki-android14-6.1.patch"
+          [ -f "$SUS_PATCH" ] || { echo "WARN: susfs common patch missing: $SUS_PATCH"; exit 0; }
+          cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
+          cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
+          ( cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_PATCH" )
+          sus_rc=$?
+          REJ="$(cd common && find . -name '*.rej' 2>/dev/null)"
+          if [ "$sus_rc" != 0 ] || [ -n "$REJ" ]; then
+            echo '=================== susfs .rej DUMP (send this to fix susfs next run) ==================='
+            for r in $REJ; do echo "----- common/$r -----"; sed -n '1,160p' "common/$r"; done
+            echo '========================================================================================'
+            echo "WARN: susfs kernel patch did NOT apply cleanly -> KSU+susfs variant skipped."
+            ( cd common && find . -name '*.rej' -delete; find . -name '*.orig' -delete ) 2>/dev/null
+            exit 0
+          fi
+
+          # 2) Add KSU-Next using the legacy integration path, then apply the KSU-side susfs patch.
+          ( cd common && rm -rf KernelSU-Next \
+              && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
+              && ( cd KernelSU-Next && (git checkout "$KSU_SUSFS_REF" || git checkout -b "$KSU_SUSFS_REF" "origin/$KSU_SUSFS_REF") ) )
+          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
+          echo "KernelSU-Next '$KSU_SUSFS_REF' commit count (drives KSU_VERSION): $KSU_CNT"
+          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_SUSFS_REF" )
+          ksu_rc=$?
+          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
+            echo "WARN: KSU-Next susfs history too shallow ($KSU_CNT) -> driver would report v0.0.1. Skipping KSU+susfs variant."
+            ksu_rc=1
+          fi
+          if [ "$ksu_rc" != 0 ]; then
+            echo "WARN: KSU-Next susfs setup failed (ksu_rc=$ksu_rc) - KSU+susfs variant skipped."
+            exit 0
+          fi
+
+          KSU_DIR="$(find common -maxdepth 2 -type d \( -name 'KernelSU-Next' -o -name 'KernelSU' \) 2>/dev/null | head -1)"
+          KSU_PATCH="$SUS/KernelSU/10_enable_susfs_for_ksu.patch"
+          [ -d "$KSU_DIR" ] || { echo "WARN: KernelSU directory not found after setup - KSU+susfs variant skipped."; exit 0; }
+          [ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side susfs patch missing: $KSU_PATCH"; exit 0; }
+          cp -v "$KSU_PATCH" "$KSU_DIR/10_enable_susfs_for_ksu.patch"
+          ( cd "$KSU_DIR" && patch -p1 --fuzz=3 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
+          ksu_sus_rc=$?
+          KSU_REJ="$(cd "$KSU_DIR" && find . -name '*.rej' 2>/dev/null)"
+          if [ "$ksu_sus_rc" != 0 ] || [ -n "$KSU_REJ" ]; then
+            echo '=================== KSU-side susfs .rej DUMP ==================='
+            for r in $KSU_REJ; do echo "----- $KSU_DIR/$r -----"; sed -n '1,160p' "$KSU_DIR/$r"; done
+            echo '================================================================'
+            echo "WARN: KSU-side susfs patch did NOT apply cleanly -> KSU+susfs variant skipped."
+            exit 0
+          fi
+
+          grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null || {
+            echo "WARN: KSU_SUSFS Kconfig symbol not found after KSU-side patch - KSU+susfs variant skipped."
+            exit 0
+          }
+          bake_ksu_version
+
+          # Enable susfs by source Kconfig defaults, not by editing gki_defconfig: this avoids the
+          # GKI savedefconfig gate while still letting extract-ikconfig prove CONFIG_KSU_SUSFS=y.
+          for kc in $(grep -rlE 'config[[:space:]]+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null | sort -u); do
+            echo "susfs: flipping defaults to y in $kc"
+            awk '
+              /^[[:space:]]*config[[:space:]]+KSU_SUSFS/ {blk=1}
+              /^[[:space:]]*config[[:space:]]/ && $0 !~ /^[[:space:]]*config[[:space:]]+KSU_SUSFS/ {blk=0}
+              { if (blk && $0 ~ /^[[:space:]]*default[[:space:]]+n[[:space:]]*$/) sub(/default[[:space:]]+n/,"default y"); print }
+            ' "$kc" > "$kc.ktmp" && mv "$kc.ktmp" "$kc"
+          done
+
+          echo ok > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
+          echo "KSU+susfs integration OK -> building variant 3."
+          set +x
+          exit 0
+
+      - name: Build kernel (KernelSU + susfs variant, non-fatal)
+        working-directory: /mnt/src/kp/kernel_platform
+        env:
+          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
+        run: |
+          set +e
+          [ -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok" ] || { echo 'KSU+susfs integration skipped - not building variant 3.'; exit 0; }
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
+            --jobs=2 --local_ram_resources=9830 \
+            --nokleaf_localversion \
+            --action_env=LOCALVERSION \
+            --action_env=KBUILD_BUILD_USER \
+            --action_env=KBUILD_BUILD_HOST \
+            --action_env=KBUILD_BUILD_TIMESTAMP
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "WARN: KSU+susfs variant build failed (rc=$rc) - variant skipped."
+            rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"; exit 0
+          fi
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          IMG=""
+          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
+          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
+          if [ -z "$IMG" ]; then echo 'WARN: KSU+susfs Image not found post-build - variant skipped'; rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"; exit 0; fi
+          CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
+          echo "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
+          if echo "$CFG" | grep -q '^CONFIG_KSU=y' && echo "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y'; then
+            echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y baked into KSU+susfs Image'
+            cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
+            echo "stashed KSU+susfs image: $IMG -> kimg/kurumi_ksu_susfs"
+          else
+            echo 'WARN: CONFIG_KSU_SUSFS=y not detected in Image config - KSU+susfs variant skipped'
+            rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
+          fi
 
       - name: Package Kurumi flashable zip (kernel only)
         working-directory: /mnt/src/kp/kernel_platform
@@ -704,22 +796,25 @@ jobs:
           [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
           [ -f "$AK/files/dtb/kurumi_gpu.dtb" ] || { echo 'ERROR: files/dtb/kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
           [ -f "$AK/files/dtb/stock_gpu.dtb" ] || { echo 'ERROR: files/dtb/stock_gpu.dtb (stock GPU dtb for revert) missing'; exit 1; }
-          # drop the freshly built kernel in, replacing any stale image
-          # Ship BOTH kernel variants under names AnyKernel will NOT auto-detect; the flash-time
-          # menu copies the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a
-          # bare Image/Image.gz here or AnyKernel would auto-flash it and bypass the choice.
+          # Drop the freshly built kernels in, replacing any stale images.
+          # Ship variants under names AnyKernel will NOT auto-detect; the flash-time menu copies
+          # the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a bare
+          # Image/Image.gz here or AnyKernel would auto-flash it and bypass the choice.
           mkdir -p "$AK/files/image"
-          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb "$AK"/files/image/kurumi_stock "$AK"/files/image/kurumi_ksu "$AK"/files/image/kurumi_ksu_susfs
+          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb \
+            "$AK"/files/image/kurumi_stock "$AK"/files/image/kurumi_ksu "$AK"/files/image/kurumi_ksu_susfs
           cp -v "$KIMG/kurumi_stock" "$AK/files/image/kurumi_stock"
           printf '%s\n' "$IMGNAME" > "$AK/files/image/kurumi_imgname"
+          _variants="stock"
           if [ -f "$KIMG/ksu_ok" ] && [ -f "$KIMG/kurumi_ksu" ]; then
             cp -v "$KIMG/kurumi_ksu" "$AK/files/image/kurumi_ksu"
-            if [ -f "$KIMG/susfs_ok" ]; then echo yes > "$AK/files/image/kurumi_ksu_susfs"; else echo no > "$AK/files/image/kurumi_ksu_susfs"; fi
-            echo "packaging BOTH variants: stock + KernelSU-Next (susfs=$(cat "$AK/files/image/kurumi_ksu_susfs"))"
-          else
-            rm -f "$AK/files/image/kurumi_ksu_susfs"
-            echo "packaging STOCK ONLY (KSU variant unavailable this run)"
+            _variants="$_variants + KSU"
           fi
+          if [ -f "$KIMG/ksu_susfs_ok" ] && [ -f "$KIMG/kurumi_ksu_susfs" ]; then
+            cp -v "$KIMG/kurumi_ksu_susfs" "$AK/files/image/kurumi_ksu_susfs"
+            _variants="$_variants + KSU+susfs"
+          fi
+          echo "packaging variants: $_variants"
           # make sure the flasher binaries stay executable inside the zip
           chmod 0755 "$AK"/tools/* "$AK"/META-INF/com/google/android/update-binary || true
           mkdir -p "$GITHUB_WORKSPACE/out-artifacts"

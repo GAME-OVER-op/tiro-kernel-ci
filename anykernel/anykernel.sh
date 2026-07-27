@@ -30,7 +30,7 @@ no_magisk_check=1
 . tools/ak3-core.sh
 
 ## ---- Kurumi interactive installer (keycheck/getevent driven menus) ----
-## Sets KPROFILE (eco|balance|full), KSELINUX (permissive|enforcing), KGPU (0|1)
+## Sets KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full), KSELINUX (permissive|enforcing), KGPU (0|1)
 . $home/tools/kurumi_menu.sh
 
 install_overlayd() {
@@ -87,26 +87,46 @@ elif [ -f "$home/files/dtb/stock_gpu.dtb" ]; then
   ui_print " " "Kurumi: STOCK GPU dtb -> vendor_boot (revert to stock)";
 fi;
 
-## ---- Kernel image selection: stock vs KernelSU-Next + susfs ----
-## CI ships BOTH variants under files/image/ (names AnyKernel will NOT auto-detect: kurumi_stock
-## / kurumi_ksu) plus the real image basename in files/image/kurumi_imgname. Copy the chosen
-## variant to $home/<name> (root) so AnyKernel's split_boot/flash_boot picks it up. If KSU was
-## requested but its image is missing (e.g. the KSU build was skipped this run), fall back to
-## stock with a warning.
+## ---- Kernel image selection: stock / KernelSU-Next / KernelSU-Next + susfs ----
+## CI ships up to THREE variants under files/image/ (names AnyKernel will NOT auto-detect):
+##   kurumi_stock, kurumi_ksu, kurumi_ksu_susfs
+## plus the real image basename in files/image/kurumi_imgname. Copy the chosen variant to
+## $home/<name> (root) so AnyKernel's split_boot/flash_boot picks it up. If a requested
+## variant is missing, fall back safely instead of flashing nothing.
 IMGNAME="Image.gz";
 [ -f "$home/files/image/kurumi_imgname" ] && IMGNAME="$(cat "$home/files/image/kurumi_imgname")";
 KSEL="";
-if [ "$KKSU" = "1" ] && [ -f "$home/files/image/kurumi_ksu" ]; then
-  KSEL="$home/files/image/kurumi_ksu";
-  _susfs=no; [ -f "$home/files/image/kurumi_ksu_susfs" ] && _susfs="$(cat "$home/files/image/kurumi_ksu_susfs")";
-  ui_print " " "Kurumi: flashing KernelSU-Next kernel (susfs: $_susfs)";
-elif [ -f "$home/files/image/kurumi_stock" ]; then
-  KSEL="$home/files/image/kurumi_stock";
-  ui_print " " "Kurumi: flashing stock (no-root) kernel";
-fi;
-if [ -n "$KSEL" ]; then
-  cp -f "$KSEL" "$home/$IMGNAME";
-fi;
+case "$KROOT" in
+  susfs)
+    if [ -f "$home/files/image/kurumi_ksu_susfs" ]; then
+      KSEL="$home/files/image/kurumi_ksu_susfs";
+      ui_print " " "Kurumi: flashing KernelSU-Next + susfs kernel";
+    elif [ -f "$home/files/image/kurumi_ksu" ]; then
+      KSEL="$home/files/image/kurumi_ksu";
+      ui_print " " "WARNING: KSU+susfs image missing - flashing KernelSU-Next only";
+    elif [ -f "$home/files/image/kurumi_stock" ]; then
+      KSEL="$home/files/image/kurumi_stock";
+      ui_print " " "WARNING: KSU+susfs image missing - flashing stock kernel";
+    fi;
+    ;;
+  ksu)
+    if [ -f "$home/files/image/kurumi_ksu" ]; then
+      KSEL="$home/files/image/kurumi_ksu";
+      ui_print " " "Kurumi: flashing KernelSU-Next kernel";
+    elif [ -f "$home/files/image/kurumi_stock" ]; then
+      KSEL="$home/files/image/kurumi_stock";
+      ui_print " " "WARNING: KernelSU image missing - flashing stock kernel";
+    fi;
+    ;;
+  *)
+    if [ -f "$home/files/image/kurumi_stock" ]; then
+      KSEL="$home/files/image/kurumi_stock";
+      ui_print " " "Kurumi: flashing stock (no-root) kernel";
+    fi;
+    ;;
+esac;
+[ -n "$KSEL" ] || abort "Kurumi: no selectable kernel image found in zip";
+cp -f "$KSEL" "$home/$IMGNAME";
 rm -f "$home/files/image/kurumi_stock" "$home/files/image/kurumi_ksu" "$home/files/image/kurumi_ksu_susfs";
 
 if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" ] || [ -e "/dev/block/by-name/init_boot$slot" ] || [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
