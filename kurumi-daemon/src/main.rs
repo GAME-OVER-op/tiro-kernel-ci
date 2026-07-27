@@ -16,6 +16,10 @@
 //     - cpufreq floor/ceiling pinned per cluster to the true HW min/max OPP
 //       (undo powerHAL/perfd raising scaling_min above the hardware minimum).
 //     - vm.max_map_count = 1048576 (headroom for Wine/Winlator emulators).
+//     - apply_surfaceflinger(): move every surfaceflinger thread from cpuset
+//       system-background ("0-1,5-6" on this ROM) to foreground ("0-7"), and
+//       raise the Adreno idle_timer from 80 to 120 ms. Immediate effect, lasts
+//       until reboot, nothing restarted.
 //   Event-driven:
 //     - touch-boost: block-read /dev/input/event* in threads (~0 CPU idle);
 //       on input, pulse /proc/sys/walt/sched_user_hint (auto-decays), debounced.
@@ -217,6 +221,53 @@ fn apply_memory() {
     write_if_diff("/proc/sys/vm/max_map_count", "1048576");
 }
 
+// ---------- one-time: SurfaceFlinger placement + GPU idle timer ----------
+// Measured on this device (NX769J / RedMagic 9 Pro): surfaceflinger sits in
+// cpuset system-background, which this ROM pins to "0-1,5-6". It therefore
+// never gets the mid cluster (cpu2-4) nor the prime core (cpu7), while
+// cpuset foreground is "0-7". Composition is latency-critical and bursty
+// (~8.33ms budget at 120Hz), so the same work on slower cores simply shows up
+// as a higher CPU percentage. Moving it to foreground gives it all 8 cores.
+//
+// kgsl idle_timer 80 -> 120 ms: with continuous client composition (a PiP
+// window drags every layer below it into GPU composition) the 80ms timer makes
+// the GPU drop to its lowest OPP between bursts and ramp back up again.
+//
+// Both writes take effect immediately and last until reboot. Nothing is
+// restarted. Deliberately one-time only, NOT part of any periodic re-check:
+// cpuset membership is per-thread and only needs setting once per SF lifetime.
+
+fn sf_pid() -> Option<u32> {
+    // /proc scan instead of shelling out to `pidof`.
+    for e in fs::read_dir("/proc").ok()?.flatten() {
+        let pid: u32 = match e.file_name().to_string_lossy().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Ok(cmd) = fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+            if cmd.trim_end_matches('\0').ends_with("surfaceflinger") {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn apply_surfaceflinger() {
+    // cpuset: every thread must be moved individually, the group is not
+    // inherited by already-running threads.
+    if let Some(pid) = sf_pid() {
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", pid)) {
+            for t in tasks.flatten() {
+                let tid = t.file_name().to_string_lossy().to_string();
+                let _ = fs::write("/dev/cpuset/foreground/tasks", &tid);
+            }
+        }
+    }
+
+    write_if_diff("/sys/class/kgsl/kgsl-3d0/idle_timer", "120");
+}
+
 // ---------- one-time + periodic: cpufreq floor / ceiling ----------
 // On init powerHAL/perfd raises scaling_min_freq one or two OPP steps above the
 // true hardware minimum, which wastes idle power. mora pins each cluster back to
@@ -364,6 +415,7 @@ fn main() {
     apply_core_ctl();
     apply_cpufreq_limits();
     apply_memory();
+    apply_surfaceflinger();
 
     // Burst: re-assert WALT/VM every 60s for the first 20 min (WALT governor is
     // late; idempotent writes settle once its sysfs dir appears).
