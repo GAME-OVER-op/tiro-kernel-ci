@@ -240,26 +240,33 @@ jobs:
           # fails the gate ("savedefconfig does not match"). MODULE_SIG_PROTECT defaults
           # to n, so removing the =y line disables it and still matches savedefconfig.
           # Release/daily cleanup for the actual GKI Image config. For COMMON's
-          # gki_defconfig, prefer deleting default-n debug/sanitizer =y lines instead
+          # gki_defconfig, prefer deleting default-n debug/UBSAN =y lines instead
           # of writing explicit '# ... is not set' entries: common runs an exact
           # savedefconfig gate, and savedefconfig omits default-n symbols.
+          #
+          # IMPORTANT: do NOT disable KASAN here. The android14-6.1 QCOM GKI
+          # strict KMI symbol list expects kasan_flag_enabled in ksymtab. Removing
+          # CONFIG_KASAN makes the build fail with:
+          #   Symbols missing from the ksymtab: kasan_flag_enabled
+          # So KASAN is kept for KMI compatibility; UBSAN/PM/thermal debug cleanup
+          # stays release-safe.
           sed -i \
             -e '/^CONFIG_MODULE_SIG_PROTECT=y/d' \
             -e '/^CONFIG_PM_DEBUG=y/d' \
             -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
             -e '/^CONFIG_THERMAL_STATISTICS=y/d' \
             -e '/^CONFIG_THERMAL_EMULATION=y/d' \
-            -e '/^CONFIG_KASAN=y/d' \
-            -e '/^CONFIG_KASAN_/d' \
-            -e '/^# CONFIG_KASAN_.* is not set$/d' \
             -e '/^CONFIG_UBSAN=y/d' \
             -e '/^CONFIG_UBSAN_/d' \
             -e '/^# CONFIG_UBSAN_.* is not set$/d' \
             "$CDEF"
           echo "--- common gki_defconfig release cleanup now: ---"
           grep -nE 'MODULE_SIG_PROTECT|PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|KASAN|UBSAN' "$CDEF" || echo '(release cleanup symbols absent from common gki_defconfig)'
-          if grep -qE '^(CONFIG_MODULE_SIG_PROTECT|CONFIG_KASAN|CONFIG_UBSAN|CONFIG_PM_DEBUG|CONFIG_THERMAL_STATISTICS|CONFIG_THERMAL_EMULATION)=y' "$CDEF"; then
-            echo 'ERROR: failed to remove active debug/sanitizer/module-protect symbols from common gki_defconfig'; exit 1
+          if grep -qE '^(CONFIG_MODULE_SIG_PROTECT|CONFIG_UBSAN|CONFIG_PM_DEBUG|CONFIG_THERMAL_STATISTICS|CONFIG_THERMAL_EMULATION)=y' "$CDEF"; then
+            echo 'ERROR: failed to remove active UBSAN/debug/module-protect symbols from common gki_defconfig'; exit 1
+          fi
+          if ! grep -q '^CONFIG_KASAN=y' "$CDEF"; then
+            echo 'ERROR: CONFIG_KASAN must stay enabled to satisfy QCOM GKI KMI symbol list (kasan_flag_enabled)'; exit 1
           fi
           # ---- kernel name (uname -r) -- injected via LOCALVERSION env, NOT the defconfig ----
           # WHY NOT the defconfig: CONFIG_LOCALVERSION is ABSENT from this branch's common
@@ -351,27 +358,27 @@ jobs:
           #   - PM_ADVANCED_DEBUG: it 'depends on PM_DEBUG'. With PM_DEBUG off it becomes
           #     invisible and vanishes from .config, so we must DELETE its line entirely
           #     (an explicit '# ... is not set' would mismatch and fail gate (2)).
-          #   - KASAN / UBSAN: disable the top-level sanitizer symbol for daily/release builds,
-          #     and DELETE their mode/suboption lines because they become hidden once the
+          #   - UBSAN: disable the top-level sanitizer symbol for daily/release builds,
+          #     and DELETE its mode/suboption lines because they become hidden once the
           #     top-level sanitizer is off. Do not delete HAVE_ARCH_*/CC_HAS_* capability
           #     symbols: those are harmless capability probes, not active instrumentation.
+          #   - KASAN: KEEP enabled. QCOM GKI strict KMI currently expects
+          #     kasan_flag_enabled in ksymtab, so disabling KASAN breaks the build.
           #
           # NOTE: the OnePlus-base-only USB_ACM / USB_SERIAL / BT_RFCOMM disables were REMOVED.
           #   They existed solely because the OnePlus common lacked __tty_port_tty_hangup; the
           #   AOSP GKI base exports it, so those stock modules build normally and we keep full
           #   ABI/module parity with the device. Only release-safe debug/thermal/sanitizer-off
           #   tweaks stay (they touch no exported symbol / KMI). PM_ADVANCED_DEBUG and
-          #   KASAN/UBSAN suboptions become hidden when their parent is off, so delete their
+          #   UBSAN suboptions become hidden when their parent is off, so delete their
           #   dependent lines instead of leaving explicit '# ... is not set' entries that
-          #   strict merged-defconfig checks may reject.
+          #   strict merged-defconfig checks may reject. KASAN suboptions stay untouched
+          #   because KASAN itself stays enabled for KMI strict mode.
           sed -i \
             -e 's/^CONFIG_PM_DEBUG=y/# CONFIG_PM_DEBUG is not set/' \
             -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
             -e 's/^CONFIG_THERMAL_STATISTICS=y/# CONFIG_THERMAL_STATISTICS is not set/' \
             -e 's/^CONFIG_THERMAL_EMULATION=y/# CONFIG_THERMAL_EMULATION is not set/' \
-            -e 's/^CONFIG_KASAN=y/# CONFIG_KASAN is not set/' \
-            -e '/^CONFIG_KASAN_/d' \
-            -e '/^# CONFIG_KASAN_.* is not set$/d' \
             -e 's/^CONFIG_UBSAN=y/# CONFIG_UBSAN is not set/' \
             -e '/^CONFIG_UBSAN_/d' \
             -e '/^# CONFIG_UBSAN_.* is not set$/d' \
