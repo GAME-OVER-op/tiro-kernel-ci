@@ -90,8 +90,8 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
           cd kurumi-daemon
-          # Build all THREE battery profiles from the single source. Each profile
-          # differs ONLY in the CPUFREQ_LIMITS table (selected by a cargo feature).
+          # Build all THREE profiles from the single source. CPU, I/O and Wi-Fi
+          # sleep/push policy are selected by cargo feature (eco|balance|full).
           # The flasher installs whichever one the user picks at flash time.
           BINDIR="$GITHUB_WORKSPACE/anykernel/files/kurumi_bin"
           mkdir -p "$BINDIR"

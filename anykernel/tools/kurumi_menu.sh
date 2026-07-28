@@ -117,9 +117,9 @@ ui_print "------------------------------";
 KP_IDX=0;
 while true; do
   ui_print " ";
-  if [ $KP_IDX -eq 0 ]; then ui_print " > Economy - max battery (big -60%, mid -30%, little -20%)"; else ui_print "   Economy - max battery (big -60%, mid -30%, little -20%)"; fi;
-  if [ $KP_IDX -eq 1 ]; then ui_print " > Balance - mid -20%, big -30%, little untouched"; else ui_print "   Balance - mid -20%, big -30%, little untouched"; fi;
-  if [ $KP_IDX -eq 2 ]; then ui_print " > Full    - no CPU limits (default)"; else ui_print "   Full    - no CPU limits (default)"; fi;
+  if [ $KP_IDX -eq 0 ]; then ui_print " > Economy - max battery + delayed push"; else ui_print "   Economy - max battery + delayed push"; fi;
+  if [ $KP_IDX -eq 1 ]; then ui_print " > Balance - balanced CPU + delayed push"; else ui_print "   Balance - balanced CPU + delayed push"; fi;
+  if [ $KP_IDX -eq 2 ]; then ui_print " > Full    - no CPU limits + soft push"; else ui_print "   Full    - no CPU limits + soft push"; fi;
   if [ $KP_IDX -eq 3 ]; then ui_print " > Skip    - do not install the battery daemon"; else ui_print "   Skip    - do not install the battery daemon"; fi;
   if $FUNCTION; then
     break;

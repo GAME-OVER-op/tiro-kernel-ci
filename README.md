@@ -33,11 +33,19 @@ The battery tuning ships inside the kernel flash - no separate Magisk module.
 on GKI) and imported by Magisk, which runs `kurumi_battery` on boot:
 - WALT smoothing: `up_rate_limit_us=1000`, `down_rate_limit_us=2000`, `hispeed_load=90`.
 - Fewer VM wakeups: `dirty_writeback_centisecs=1500`, `stat_interval=10`, MGLRU `min_ttl_ms=1000`.
+- UFS/read-ahead profile after `boot_completed + 90s`:
+  - `eco`: `clkgate=1`, `clkscale=1`, `read_ahead_kb=128`.
+  - `balance`: `clkgate=1`, `clkscale=1`, `read_ahead_kb=512`.
+  - `full`: `clkgate=1`, `clkscale=0`, `read_ahead_kb=2048` so UFS can still sleep at idle.
+- Wi-Fi sleep/push profile after `boot_completed + 90s`:
+  - `eco` / `balance`: delayed push. Wi-Fi stays ON, Android background scan/perf knobs are disabled, and only the direct WLAN endpoint `power/wakeup` is disabled. The PCIe parent chain is not touched.
+  - `full`: soft push. Wi-Fi stays ON, Android background scan/perf knobs are disabled, and direct WLAN wakeup is kept/enabled so push notifications are close to stock.
 
-WALT comes up late at boot, so the script waits 5 min then applies once (values
-are stable once written). Only `/sys` + `/proc` are written - reversible, no
-partition writes, no log file. Requires Magisk (root). Tune values at the top of
-`anykernel/ramdisk/overlay.d/sbin/kurumi_battery`. Revert: reflash stock `init_boot`.
+The Rust daemon is launched by `init.kurumi.rc` on `sys.boot_completed=1`, then
+waits 90 seconds before applying the one-time profile. There is no screen polling
+and no periodic Wi-Fi loop. Only `/sys` + `/proc` + Android shell settings are
+written - reversible, no partition writes, no log file. Requires Magisk (root).
+Revert: reflash stock `init_boot` or choose `Skip` in the installer profile menu.
 
 ## Build identity
 `/proc/version` is forced to `(kurumi@dev)` with the REAL build time by hard-overriding
