@@ -732,38 +732,80 @@ jobs:
           repair_susfs_namespace_reject() {
             # android14-6.1 may only reject the first fs/namespace.c hunk when nearby
             # includes changed upstream. That hunk only adds susfs include/externs and
-            # CL_COPY_MNT_NS. All later namespace hunks are usually already applied.
+            # CL_COPY_MNT_NS. All later namespace hunks can be already applied.
             # Repair this one known-safe reject instead of skipping the whole variant.
             [ -f common/fs/namespace.c.rej ] || return 1
             grep -q 'CL_COPY_MNT_NS' common/fs/namespace.c.rej || return 1
             grep -q 'susfs_def.h' common/fs/namespace.c.rej || return 1
             python3 <<'PY_REPAIR'
           from pathlib import Path
+          import re
+
           p = Path('common/fs/namespace.c')
           s = p.read_text()
           changed = False
+
+          # Insert the missing include after mnt_idmapping.h. Use regex, not an exact
+          # multi-line anchor, because Google common can add comments/blank lines here.
           if '#include <linux/susfs_def.h>' not in s:
-              anchor = '#include <linux/mnt_idmapping.h>\n'
-              ins = anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
-              if anchor not in s:
-                  raise SystemExit('namespace repair: mnt_idmapping include anchor not found')
-              s = s.replace(anchor, ins, 1)
+              repl = '#include <linux/mnt_idmapping.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+              s2, n = re.subn(r'#include <linux/mnt_idmapping\.h>\s*\n', repl, s, count=1)
+              if n == 0:
+                  # Fallback: still keep the include in the local include section before pnode.h.
+                  s2, n = re.subn(r'(#include "pnode\.h"\s*\n)', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n\\1', s, count=1)
+              if n == 0:
+                  raise SystemExit('namespace repair: no include anchor found')
+              s = s2
               changed = True
-          block = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-          extern bool susfs_is_current_ksu_domain(void);
-          extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
-          
-          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
-          
-          #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-          
-          '''
-          if '#define CL_COPY_MNT_NS' not in s or 'extern bool susfs_is_current_ksu_domain' not in s or 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' not in s:
-              anchor = '#include "internal.h"\n\n'
-              if anchor not in s:
-                  raise SystemExit('namespace repair: internal.h anchor not found')
-              s = s.replace(anchor, anchor + block, 1)
+
+          need_block = (
+              '#define CL_COPY_MNT_NS' not in s or
+              'extern bool susfs_is_current_ksu_domain' not in s or
+              'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' not in s
+          )
+          if need_block:
+              block = (
+                  '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                  'extern bool susfs_is_current_ksu_domain(void);\n'
+                  'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n'
+                  '#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n\n'
+                  '#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n'
+              )
+              lines = s.splitlines(True)
+              insert_at = None
+              for i, line in enumerate(lines):
+                  if line.strip() == '#include "internal.h"':
+                      insert_at = i + 1
+                      while insert_at < len(lines) and lines[insert_at].strip() == '':
+                          insert_at += 1
+                      break
+              if insert_at is None:
+                  for i, line in enumerate(lines):
+                      if line.strip().startswith('/* Maximum number of mounts'):
+                          insert_at = i
+                          break
+              if insert_at is None:
+                  for i, line in enumerate(lines):
+                      if line.strip() == '#include "pnode.h"':
+                          insert_at = i + 1
+                          break
+              if insert_at is None:
+                  raise SystemExit('namespace repair: no extern block anchor found')
+              lines.insert(insert_at, block)
+              s = ''.join(lines)
               changed = True
+
+          # Hard verification. The previous repair failed because use-sites existed but
+          # declarations did not; make that impossible to miss.
+          for needle in (
+              '#include <linux/susfs_def.h>',
+              'extern bool susfs_is_current_ksu_domain(void);',
+              'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;',
+              '#define CL_COPY_MNT_NS BIT(25)',
+          ):
+              if needle not in s:
+                  raise SystemExit('namespace repair: missing after repair: %s' % needle)
+
           if changed:
               p.write_text(s)
           print('namespace repair: applied' if changed else 'namespace repair: already present')
