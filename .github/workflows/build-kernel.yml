@@ -883,56 +883,132 @@ jobs:
           from pathlib import Path
           import re
 
-          # Final namespace safety pass.
+          def insert_after_internal_or_mountmax(text: str, block: str) -> tuple[str, bool]:
+              if block.strip() in text:
+                  return text, False
+              lines = text.splitlines(True)
+              insert_at = None
+              for i, line in enumerate(lines):
+                  if line.strip() == '#include "internal.h"':
+                      insert_at = i + 1
+                      while insert_at < len(lines) and lines[insert_at].strip() == '':
+                          insert_at += 1
+                      break
+              if insert_at is None:
+                  for i, line in enumerate(lines):
+                      if line.strip().startswith('/* Maximum number of mounts'):
+                          insert_at = i
+                          break
+              if insert_at is None:
+                  return text, False
+              lines.insert(insert_at, block)
+              return ''.join(lines), True
+
+          # Final namespace safety/compat pass. Some susfs4ksu history revisions
+          # partially apply fs/namespace.c hunks but miss declarations for v2.0 symbols.
           ns = Path('common/fs/namespace.c')
           if ns.exists():
               s = ns.read_text(errors='ignore')
               changed = False
-              if '#include <linux/susfs_def.h>' not in s and ('susfs_is_current_ksu_domain' in s or 'susfs_is_sdcard_android_data_not_decrypted' in s):
+              if '#include <linux/susfs_def.h>' not in s and (
+                  'susfs_is_current_ksu_domain' in s or
+                  'susfs_is_sdcard_android_data_not_decrypted' in s or
+                  'susfs_is_boot_completed_triggered' in s or
+                  'susfs_ksu_mnt_group_ida' in s or
+                  'susfs_ksu_mounts' in s
+              ):
                   anchor = '#include <linux/mnt_idmapping.h>\n'
                   if anchor in s:
                       s = s.replace(anchor, anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n', 1)
                       changed = True
+
+              need_ns = []
+              if 'susfs_is_current_ksu_domain(' in s and 'extern bool susfs_is_current_ksu_domain(void);' not in s:
+                  need_ns.append('extern bool susfs_is_current_ksu_domain(void);')
+              if 'susfs_is_sdcard_android_data_not_decrypted' in s and 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;' not in s:
+                  need_ns.append('extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;')
+              if 'susfs_is_boot_completed_triggered' in s and 'extern bool susfs_is_boot_completed_triggered;' not in s:
+                  need_ns.append('extern bool susfs_is_boot_completed_triggered;')
+              if 'susfs_ksu_mnt_group_ida' in s and 'extern struct ida susfs_ksu_mnt_group_ida;' not in s:
+                  need_ns.append('extern struct ida susfs_ksu_mnt_group_ida;')
+              if 'susfs_ksu_mounts' in s and 'extern atomic64_t susfs_ksu_mounts;' not in s:
+                  need_ns.append('extern atomic64_t susfs_ksu_mounts;')
+              if 'CL_COPY_MNT_NS' in s and '#define CL_COPY_MNT_NS BIT(25)' not in s:
+                  need_ns.append('#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */')
+
+              if need_ns:
+                  block = '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n' + '\n'.join(need_ns) + '\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n'
+                  s2, did = insert_after_internal_or_mountmax(s, block)
+                  if not did:
+                      raise SystemExit('KSU+susfs repair: fs/namespace.c declaration anchor not found')
+                  s = s2
+                  changed = True
+
               if changed:
                   ns.write_text(s)
-                  print('KSU+susfs repair: fs/namespace.c include fixed')
+                  print('KSU+susfs repair: fs/namespace.c declarations/includes fixed')
 
           susfs_text = ''
-          for p in (Path('common/fs/susfs.c'), Path('common/include/linux/susfs.h')):
+          for p in (Path('common/fs/susfs.c'), Path('common/include/linux/susfs.h'), Path('common/include/linux/susfs_def.h')):
               if p.exists():
                   susfs_text += p.read_text(errors='ignore') + '\n'
 
           for sc in Path('common/drivers/kernelsu').rglob('supercalls.c'):
               s = sc.read_text(errors='ignore')
-              if 'susfs_' not in s:
+              if 'susfs_' not in s and 'CMD_SUSFS_' not in s:
                   continue
+              changed = False
+
+              # KernelSU-Next v3.1.0-legacy-susfs references a non_su_procs command,
+              # while the matching v2.0-era susfs common tree exposes all_procs.
+              if 'susfs_set_hide_sus_mnts_for_non_su_procs' in s and 'susfs_set_hide_sus_mnts_for_non_su_procs' not in susfs_text:
+                  if 'susfs_set_hide_sus_mnts_for_all_procs' in susfs_text:
+                      s = s.replace('susfs_set_hide_sus_mnts_for_non_su_procs', 'susfs_set_hide_sus_mnts_for_all_procs')
+                      s = s.replace('CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS', 'CMD_SUSFS_HIDE_SUS_MNTS_FOR_ALL_PROCS')
+                      changed = True
+                      print('KSU+susfs repair: mapped hide_sus_mnts non_su API to all_procs API')
+
               missing_api = []
-              for name in ('susfs_set_i_state_on_external_dir', 'susfs_add_try_umount'):
+              for name in ('susfs_set_i_state_on_external_dir', 'susfs_add_try_umount', 'susfs_set_hide_sus_mnts_for_all_procs'):
                   if name in s and name not in susfs_text:
                       missing_api.append(name)
               if missing_api:
                   raise SystemExit('KSU+susfs incompatible API after history selection in %s: %s' % (sc, ', '.join(missing_api)))
 
-              changed = False
               if '#include <linux/susfs.h>' not in s:
                   m = re.search(r'^(#include <linux/[^>]+>\n)+', s, flags=re.M)
                   if m:
                       s = s[:m.end()] + '#include <linux/susfs.h>\n' + s[m.end():]
                       changed = True
 
-              replacements = [
-                  (r'pr_info\("sys_reboot: ppptr: 0x%lx \\n",\s*ppptr\);', 'pr_info("sys_reboot: ppptr: 0x%lx \\n", (unsigned long)ppptr);'),
-                  (r'pr_info\("sys_reboot: u_pptr: 0x%lx \\n",\s*u_pptr\);', 'pr_info("sys_reboot: u_pptr: 0x%llx \\n", (unsigned long long)u_pptr);'),
-                  (r'pr_info\("sys_reboot: u_ptr: 0x%lx \\n",\s*u_ptr\);', 'pr_info("sys_reboot: u_ptr: 0x%llx \\n", (unsigned long long)u_ptr);'),
+              # Use lambda replacements: re.sub replacement strings treat backslashes
+              # specially, and v6 accidentally wrote real newlines into C strings.
+              repls = [
+                  (r'pr_info\("sys_reboot:\s*ppptr:\s*0x%lx\s*\\+n",\s*ppptr\);', lambda m: 'pr_info("sys_reboot: ppptr: 0x%lx \\n", (unsigned long)ppptr);'),
+                  (r'pr_info\("sys_reboot:\s*u_pptr:\s*0x%lx\s*\\+n",\s*u_pptr\);', lambda m: 'pr_info("sys_reboot: u_pptr: 0x%llx \\n", (unsigned long long)u_pptr);'),
+                  (r'pr_info\("sys_reboot:\s*u_ptr:\s*0x%lx\s*\\+n",\s*u_ptr\);', lambda m: 'pr_info("sys_reboot: u_ptr: 0x%llx \\n", (unsigned long long)u_ptr);'),
               ]
-              for pat, repl in replacements:
-                  s2, n = re.subn(pat, repl, s)
+              for pat, fn in repls:
+                  s2, n = re.subn(pat, fn, s)
                   if n:
                       s = s2
                       changed = True
+
+              # Repair a previously broken v6-style multiline string if present.
+              broken = [
+                  (r'pr_info\("sys_reboot:\s*ppptr:\s*0x%lx\s*\n"\s*,\s*\(unsigned long\)ppptr\);', lambda m: 'pr_info("sys_reboot: ppptr: 0x%lx \\n", (unsigned long)ppptr);'),
+                  (r'pr_info\("sys_reboot:\s*u_pptr:\s*0x%llx\s*\n"\s*,\s*\(unsigned long long\)u_pptr\);', lambda m: 'pr_info("sys_reboot: u_pptr: 0x%llx \\n", (unsigned long long)u_pptr);'),
+                  (r'pr_info\("sys_reboot:\s*u_ptr:\s*0x%llx\s*\n"\s*,\s*\(unsigned long long\)u_ptr\);', lambda m: 'pr_info("sys_reboot: u_ptr: 0x%llx \\n", (unsigned long long)u_ptr);'),
+              ]
+              for pat, fn in broken:
+                  s2, n = re.subn(pat, fn, s, flags=re.S)
+                  if n:
+                      s = s2
+                      changed = True
+
               if changed:
                   sc.write_text(s)
-                  print('KSU+susfs repair: %s includes/format fixed' % sc)
+                  print('KSU+susfs repair: %s compatibility/includes/format fixed' % sc)
           PY_REPAIR_KSU
 
           # 1) Add KernelSU-Next with pre-integrated SuSFS glue.
