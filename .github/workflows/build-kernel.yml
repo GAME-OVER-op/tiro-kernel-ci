@@ -753,38 +753,76 @@ jobs:
             fi
           }
 
-          # 1) Add susfs to the GKI common tree.
-          rm -rf susfs4ksu
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
-          SUS="$PWD/susfs4ksu/kernel_patches"
-          SUS_PATCH="$SUS/50_add_susfs_in_gki-android14-6.1.patch"
-          [ -f "$SUS_PATCH" ] || { echo "WARN: susfs common patch missing: $SUS_PATCH"; exit 0; }
-          cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
-          cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
-          repair_susfs_namespace_reject() {
-            # android14-6.1 may only reject the first fs/namespace.c hunk when nearby
-            # includes changed upstream. That hunk only adds susfs include/externs and
-            # CL_COPY_MNT_NS. All later namespace hunks can be already applied.
-            # Repair this one known-safe reject instead of skipping the whole variant.
-            [ -f common/fs/namespace.c.rej ] || return 1
-            grep -q 'CL_COPY_MNT_NS' common/fs/namespace.c.rej || return 1
-            grep -q 'susfs_def.h' common/fs/namespace.c.rej || return 1
-            python3 <<'PY_REPAIR'
+          # v6: select KernelSU-Next SuSFS first, then select a matching susfs4ksu
+          # common-patch history revision by scanning the APIs referenced by supercalls.c.
+          # This avoids the v5 mismatch where v3.1.0-legacy-susfs expected v2.0.0-era
+          # functions but susfs4ksu gki-android14-6.1 HEAD had already moved to v2.2.0.
+
+          cat > /tmp/kurumi_select_susfs_commit.py <<'PY_SELECT_SUS'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          ksu_root = Path('common/drivers/kernelsu')
+          supercalls = ''
+          for p in ksu_root.rglob('supercalls.c'):
+              supercalls += p.read_text(errors='ignore') + '\n'
+          required = []
+          for name in ('susfs_set_i_state_on_external_dir', 'susfs_add_try_umount'):
+              if name in supercalls:
+                  required.append(name)
+
+          print('KSU+susfs: supercalls required SuSFS APIs:', ', '.join(required) if required else '(none)')
+          if not required:
+              Path('/tmp/kurumi_susfs_selected_commit').write_text('HEAD')
+              sys.exit(0)
+
+          repo = Path('susfs4ksu')
+          commits = subprocess.check_output(['git', '-C', str(repo), 'rev-list', '--max-count=1000', 'HEAD'], text=True).splitlines()
+          for commit in commits:
+              try:
+                  text = subprocess.check_output([
+                      'git', '-C', str(repo), 'grep', '-n', '-e', 'susfs_', commit, '--',
+                      'kernel_patches/fs', 'kernel_patches/include/linux'
+                  ], text=True, stderr=subprocess.DEVNULL)
+              except subprocess.CalledProcessError:
+                  continue
+              if all(name in text for name in required):
+                  Path('/tmp/kurumi_susfs_selected_commit').write_text(commit)
+                  print('KSU+susfs: selected compatible susfs4ksu commit:', commit)
+                  sys.exit(0)
+
+          raise SystemExit('no susfs4ksu history commit provides required APIs: ' + ', '.join(required))
+          PY_SELECT_SUS
+
+          cat > /tmp/kurumi_repair_namespace.py <<'PY_REPAIR_NS'
           from pathlib import Path
           import re
+
+          rej = Path('common/fs/namespace.c.rej')
+          if not rej.exists():
+              raise SystemExit(1)
+          r = rej.read_text(errors='ignore')
+          if 'CL_COPY_MNT_NS' not in r or 'susfs_def.h' not in r:
+              raise SystemExit(1)
 
           p = Path('common/fs/namespace.c')
           s = p.read_text()
           changed = False
-
-          # Insert the missing include after mnt_idmapping.h. Use regex, not an exact
-          # multi-line anchor, because Google common can add comments/blank lines here.
           if '#include <linux/susfs_def.h>' not in s:
-              repl = '#include <linux/mnt_idmapping.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
-              s2, n = re.subn(r'#include <linux/mnt_idmapping\.h>\s*\n', repl, s, count=1)
+              s2, n = re.subn(
+                  r'#include <linux/mnt_idmapping\.h>\s*\n',
+                  '#include <linux/mnt_idmapping.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n',
+                  s,
+                  count=1,
+              )
               if n == 0:
-                  # Fallback: still keep the include in the local include section before pnode.h.
-                  s2, n = re.subn(r'(#include "pnode\.h"\s*\n)', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n\\1', s, count=1)
+                  s2, n = re.subn(
+                      r'(#include "pnode\.h"\s*\n)',
+                      '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n\\1',
+                      s,
+                      count=1,
+                  )
               if n == 0:
                   raise SystemExit('namespace repair: no include anchor found')
               s = s2
@@ -827,8 +865,6 @@ jobs:
               s = ''.join(lines)
               changed = True
 
-          # Hard verification. The previous repair failed because use-sites existed but
-          # declarations did not; make that impossible to miss.
           for needle in (
               '#include <linux/susfs_def.h>',
               'extern bool susfs_is_current_ksu_domain(void);',
@@ -836,22 +872,142 @@ jobs:
               '#define CL_COPY_MNT_NS BIT(25)',
           ):
               if needle not in s:
-                  raise SystemExit('namespace repair: missing after repair: %s' % needle)
+                  raise SystemExit('namespace repair: missing after repair: ' + needle)
 
           if changed:
               p.write_text(s)
           print('namespace repair: applied' if changed else 'namespace repair: already present')
-          PY_REPAIR
-          }
+          PY_REPAIR_NS
 
-          ( cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_PATCH" )
+          cat > /tmp/kurumi_repair_ksu_susfs.py <<'PY_REPAIR_KSU'
+          from pathlib import Path
+          import re
+
+          # Final namespace safety pass.
+          ns = Path('common/fs/namespace.c')
+          if ns.exists():
+              s = ns.read_text(errors='ignore')
+              changed = False
+              if '#include <linux/susfs_def.h>' not in s and ('susfs_is_current_ksu_domain' in s or 'susfs_is_sdcard_android_data_not_decrypted' in s):
+                  anchor = '#include <linux/mnt_idmapping.h>\n'
+                  if anchor in s:
+                      s = s.replace(anchor, anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n', 1)
+                      changed = True
+              if changed:
+                  ns.write_text(s)
+                  print('KSU+susfs repair: fs/namespace.c include fixed')
+
+          susfs_text = ''
+          for p in (Path('common/fs/susfs.c'), Path('common/include/linux/susfs.h')):
+              if p.exists():
+                  susfs_text += p.read_text(errors='ignore') + '\n'
+
+          for sc in Path('common/drivers/kernelsu').rglob('supercalls.c'):
+              s = sc.read_text(errors='ignore')
+              if 'susfs_' not in s:
+                  continue
+              missing_api = []
+              for name in ('susfs_set_i_state_on_external_dir', 'susfs_add_try_umount'):
+                  if name in s and name not in susfs_text:
+                      missing_api.append(name)
+              if missing_api:
+                  raise SystemExit('KSU+susfs incompatible API after history selection in %s: %s' % (sc, ', '.join(missing_api)))
+
+              changed = False
+              if '#include <linux/susfs.h>' not in s:
+                  m = re.search(r'^(#include <linux/[^>]+>\n)+', s, flags=re.M)
+                  if m:
+                      s = s[:m.end()] + '#include <linux/susfs.h>\n' + s[m.end():]
+                      changed = True
+
+              replacements = [
+                  (r'pr_info\("sys_reboot: ppptr: 0x%lx \\n",\s*ppptr\);', 'pr_info("sys_reboot: ppptr: 0x%lx \\n", (unsigned long)ppptr);'),
+                  (r'pr_info\("sys_reboot: u_pptr: 0x%lx \\n",\s*u_pptr\);', 'pr_info("sys_reboot: u_pptr: 0x%llx \\n", (unsigned long long)u_pptr);'),
+                  (r'pr_info\("sys_reboot: u_ptr: 0x%lx \\n",\s*u_ptr\);', 'pr_info("sys_reboot: u_ptr: 0x%llx \\n", (unsigned long long)u_ptr);'),
+              ]
+              for pat, repl in replacements:
+                  s2, n = re.subn(pat, repl, s)
+                  if n:
+                      s = s2
+                      changed = True
+              if changed:
+                  sc.write_text(s)
+                  print('KSU+susfs repair: %s includes/format fixed' % sc)
+          PY_REPAIR_KSU
+
+          # 1) Add KernelSU-Next with pre-integrated SuSFS glue.
+          (
+            cd common && rm -rf KernelSU-Next \
+            && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
+            && (
+              cd KernelSU-Next \
+              && git fetch --tags --force \
+              && SELECTED_REF="" \
+              && for ref in "$KSU_SUSFS_REF" v3.2.0-legacy-susfs-v2 v3.1.0-legacy-susfs legacy-susfs-v2 legacy-susfs; do \
+                   [ -n "$ref" ] || continue; \
+                   if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi; \
+                   if git rev-parse --verify --quiet "origin/$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi; \
+                 done \
+              && [ -n "$SELECTED_REF" ] \
+              && echo "$SELECTED_REF" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" \
+              && (git checkout "$SELECTED_REF" || git checkout "tags/$SELECTED_REF" || git checkout -b "$SELECTED_REF" "origin/$SELECTED_REF")
+            )
+          )
+          ksu_pre_rc=$?
+          if [ "$ksu_pre_rc" != 0 ]; then
+            echo "WARN: no usable pre-integrated KernelSU-Next SuSFS ref found (requested '$KSU_SUSFS_REF') - KSU+susfs variant skipped."
+            exit 0
+          fi
+          KSU_SUSFS_SELECTED_REF="$(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" 2>/dev/null)"
+          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
+          echo "KernelSU-Next SuSFS ref '$KSU_SUSFS_SELECTED_REF' commit count (drives KSU_VERSION): $KSU_CNT"
+          (
+            cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_SUSFS_SELECTED_REF"
+          )
+          ksu_rc=$?
+          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
+            echo "WARN: KSU-Next susfs history too shallow ($KSU_CNT) -> driver would report v0.0.1. Skipping KSU+susfs variant."
+            ksu_rc=1
+          fi
+          if [ "$ksu_rc" != 0 ]; then
+            echo "WARN: KSU-Next susfs setup failed (ksu_rc=$ksu_rc) - KSU+susfs variant skipped."
+            exit 0
+          fi
+          KSU_DIR="$(find common -maxdepth 2 -type d \( -name 'KernelSU-Next' -o -name 'KernelSU' \) 2>/dev/null | head -1)"
+          [ -d "$KSU_DIR" ] || { echo "WARN: KernelSU directory not found after setup - KSU+susfs variant skipped."; exit 0; }
+          grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null || {
+            echo "WARN: selected KernelSU-Next ref '$KSU_SUSFS_SELECTED_REF' has no CONFIG_KSU_SUSFS - KSU+susfs variant skipped."
+            exit 0
+          }
+          echo "KSU+susfs: selected KernelSU-Next ref exposes CONFIG_KSU_SUSFS."
+
+          # 2) Add a matching SuSFS common patch revision.
+          rm -rf susfs4ksu
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
+          python3 /tmp/kurumi_select_susfs_commit.py
+          sus_select_rc=$?
+          if [ "$sus_select_rc" != 0 ]; then
+            echo "WARN: no compatible susfs4ksu common revision found for '$KSU_SUSFS_SELECTED_REF' - KSU+susfs variant skipped."
+            exit 0
+          fi
+          SUS_COMMIT="$(cat /tmp/kurumi_susfs_selected_commit 2>/dev/null || echo HEAD)"
+          [ "$SUS_COMMIT" = HEAD ] || git -C susfs4ksu checkout "$SUS_COMMIT"
+          echo "KSU+susfs: using susfs4ksu common revision: $(git -C susfs4ksu rev-parse --short HEAD)"
+          SUS="$PWD/susfs4ksu/kernel_patches"
+          SUS_PATCH="$SUS/50_add_susfs_in_gki-android14-6.1.patch"
+          [ -f "$SUS_PATCH" ] || { echo "WARN: susfs common patch missing: $SUS_PATCH"; exit 0; }
+          cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
+          cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
+          (
+            cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_PATCH"
+          )
           sus_rc=$?
           REJ="$(cd common && find . -name '*.rej' 2>/dev/null | sort)"
           if [ "$sus_rc" != 0 ] || [ -n "$REJ" ]; then
             echo '=================== susfs .rej DUMP (send this to fix susfs next run) ==================='
             for r in $REJ; do echo "----- common/$r -----"; sed -n '1,160p' "common/$r"; done
             echo '========================================================================================'
-            if [ "$REJ" = "./fs/namespace.c.rej" ] && repair_susfs_namespace_reject; then
+            if [ "$REJ" = "./fs/namespace.c.rej" ] && python3 /tmp/kurumi_repair_namespace.py; then
               rm -f common/fs/namespace.c.rej
               REJ="$(cd common && find . -name '*.rej' 2>/dev/null | sort)"
               if [ -z "$REJ" ]; then
@@ -866,114 +1022,7 @@ jobs:
             fi
           fi
 
-          # 2) Add KernelSU-Next with SuSFS glue.
-          # Do NOT apply susfs4ksu/KernelSU/10_enable_susfs_for_ksu.patch to the
-          # moving KernelSU-Next legacy branch. That patch targets KernelSU-style
-          # sources and currently rejects across Kbuild/Kconfig/core/hook/policy.
-          # Instead use a KernelSU-Next ref that already carries KSU_SUSFS glue,
-          # then combine it with the common/fs SuSFS patch applied above.
-          ( cd common && rm -rf KernelSU-Next               && git clone https://github.com/KernelSU-Next/KernelSU-Next.git               && ( cd KernelSU-Next                    && git fetch --tags --force                    && SELECTED_REF=""                    && for ref in "$KSU_SUSFS_REF" v3.2.0-legacy-susfs-v2 v3.1.0-legacy-susfs legacy-susfs-v2 legacy-susfs; do                         [ -n "$ref" ] || continue;                         if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi;                         if git rev-parse --verify --quiet "origin/$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi;                       done                    && [ -n "$SELECTED_REF" ]                    && echo "$SELECTED_REF" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref"                    && (git checkout "$SELECTED_REF" || git checkout "tags/$SELECTED_REF" || git checkout -b "$SELECTED_REF" "origin/$SELECTED_REF") ) )
-          ksu_pre_rc=$?
-          if [ "$ksu_pre_rc" != 0 ]; then
-            echo "WARN: no usable pre-integrated KernelSU-Next SuSFS ref found (requested '$KSU_SUSFS_REF') - KSU+susfs variant skipped."
-            exit 0
-          fi
-          KSU_SUSFS_SELECTED_REF="$(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" 2>/dev/null || echo "$KSU_SUSFS_REF")"
-          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
-          echo "KernelSU-Next SuSFS ref '$KSU_SUSFS_SELECTED_REF' commit count (drives KSU_VERSION): $KSU_CNT"
-          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_SUSFS_SELECTED_REF" )
-          ksu_rc=$?
-          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
-            echo "WARN: KSU-Next susfs history too shallow ($KSU_CNT) -> driver would report v0.0.1. Skipping KSU+susfs variant."
-            ksu_rc=1
-          fi
-          if [ "$ksu_rc" != 0 ]; then
-            echo "WARN: KSU-Next susfs setup failed (ksu_rc=$ksu_rc) - KSU+susfs variant skipped."
-            exit 0
-          fi
-
-          KSU_DIR="$(find common -maxdepth 2 -type d \( -name 'KernelSU-Next' -o -name 'KernelSU' \) 2>/dev/null | head -1)"
-          [ -d "$KSU_DIR" ] || { echo "WARN: KernelSU directory not found after setup - KSU+susfs variant skipped."; exit 0; }
-          if grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null; then
-            echo "KSU+susfs: selected KernelSU-Next ref exposes CONFIG_KSU_SUSFS; verifying API compatibility."
-          else
-            echo "WARN: selected KernelSU-Next ref '$KSU_SUSFS_SELECTED_REF' has no CONFIG_KSU_SUSFS - KSU+susfs variant skipped."
-            exit 0
-          fi
-
-          repair_ksu_susfs_build_edges() {
-            cat > /tmp/kurumi_fix_ksu_susfs.py <<'PY_FIX_KSU'
-          from pathlib import Path
-          import re
-          
-          # Known fs/namespace.c edge: the first hunk can reject while later hunks applied,
-          # leaving use-sites without the include/extern/#define block.
-          ns = Path('common/fs/namespace.c')
-          if ns.exists():
-              s = ns.read_text()
-              changed = False
-              if '#include <linux/susfs_def.h>' not in s and ('susfs_is_current_ksu_domain' in s or 'susfs_is_sdcard_android_data_not_decrypted' in s):
-                  anchor = '#include <linux/mnt_idmapping.h>\\n'
-                  if anchor in s:
-                      s = s.replace(anchor, anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n#include <linux/susfs_def.h>\\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n', 1)
-                      changed = True
-              need_ns_block = (
-                  ('susfs_is_current_ksu_domain' in s and 'extern bool susfs_is_current_ksu_domain' not in s) or
-                  ('susfs_is_sdcard_android_data_not_decrypted' in s and 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' not in s) or
-                  ('CL_COPY_MNT_NS' in s and '#define CL_COPY_MNT_NS' not in s)
-              )
-              if need_ns_block:
-                  anchor = '#include "internal.h"\\n\\n'
-                  block = (
-                      '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n'
-                      'extern bool susfs_is_current_ksu_domain(void);\\n'
-                      'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\\n\\n'
-                      '#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\\n\\n'
-                      '#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n\\n'
-                  )
-                  if anchor in s:
-                      s = s.replace(anchor, anchor + block, 1)
-                      changed = True
-              if changed:
-                  ns.write_text(s)
-                  print('KSU+susfs repair: fs/namespace.c declarations fixed')
-          
-          # Guard against accidentally using a pre-integrated KSU ref whose supercalls.c
-          # expects a newer SuSFS common API than susfs4ksu/$SUSFS_BRANCH provides.
-          susfs_c = Path('common/fs/susfs.c').read_text() if Path('common/fs/susfs.c').exists() else ''
-          for sc in Path('common/drivers/kernelsu').rglob('supercalls.c'):
-              s = sc.read_text()
-              if 'susfs_' not in s:
-                  continue
-              missing_api = []
-              for name in ('susfs_set_i_state_on_external_dir', 'susfs_add_try_umount'):
-                  if name in s and name not in susfs_c:
-                      missing_api.append(name)
-              if missing_api:
-                  raise SystemExit('KSU+susfs incompatible API in %s: %s. Use plain KSU_SUSFS_REF=legacy + matching susfs4ksu patch, not a mismatched pre-integrated ref.' % (sc, ', '.join(missing_api)))
-              changed = False
-              if '#include <linux/susfs.h>' not in s:
-                  m = re.search(r'^(#include <linux/[^>]+>\\n)+', s, flags=re.M)
-                  if m:
-                      s = s[:m.end()] + '#include <linux/susfs.h>\\n' + s[m.end():]
-                      changed = True
-              replacements = [
-                  (r'pr_info\\("sys_reboot: ppptr: 0x%lx \\\\n",\\s*ppptr\\);', 'pr_info("sys_reboot: ppptr: 0x%lx \\\\n", (unsigned long)ppptr);'),
-                  (r'pr_info\\("sys_reboot: u_pptr: 0x%lx \\\\n",\\s*u_pptr\\);', 'pr_info("sys_reboot: u_pptr: 0x%llx \\\\n", (unsigned long long)u_pptr);'),
-                  (r'pr_info\\("sys_reboot: u_ptr: 0x%lx \\\\n",\\s*u_ptr\\);', 'pr_info("sys_reboot: u_ptr: 0x%llx \\\\n", (unsigned long long)u_ptr);'),
-              ]
-              for pat, repl in replacements:
-                  ns2, n = re.subn(pat, repl, s)
-                  if n:
-                      s = ns2
-                      changed = True
-              if changed:
-                  sc.write_text(s)
-                  print('KSU+susfs repair: %s includes/format fixed' % sc)
-          PY_FIX_KSU
-            python3 /tmp/kurumi_fix_ksu_susfs.py
-          }
-          if ! repair_ksu_susfs_build_edges; then
+          if ! python3 /tmp/kurumi_repair_ksu_susfs.py; then
             echo "WARN: KSU+susfs source compatibility repair failed -> KSU+susfs variant skipped."
             exit 0
           fi
@@ -984,8 +1033,6 @@ jobs:
           }
           bake_ksu_version
 
-          # Enable susfs by source Kconfig defaults, not by editing gki_defconfig: this avoids the
-          # GKI savedefconfig gate while still letting extract-ikconfig prove CONFIG_KSU_SUSFS=y.
           for kc in $(grep -rlE 'config[[:space:]]+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null | sort -u); do
             echo "susfs: flipping defaults to y in $kc"
             awk '
