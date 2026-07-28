@@ -29,11 +29,13 @@ jobs:
       GKI_COMMON_REPO: https://android.googlesource.com/kernel/common
       GKI_COMMON_BRANCH: android14-6.1
       # --- root variants ---
-      # Keep plain KSU on the fast-moving next branch. For susfs, prefer a KSU-Next
-      # susfs-tagged ref, because susfs4ksu's KSU-side patch does not apply cleanly
-      # to current plain KSU-Next legacy/next trees anymore.
+      # Keep plain KSU on the fast-moving next branch. For susfs, use the plain
+      # KSU-Next legacy branch and apply the matching susfs4ksu KSU-side patch from
+      # the same susfs4ksu branch. Avoid pre-integrated *legacy-susfs tags here:
+      # current tags can expect newer/renamed SuSFS APIs than the gki-android14-6.1
+      # common patch provides, which produces undeclared susfs_* symbols.
       KSU_NEXT_REF: next
-      KSU_SUSFS_REF: v3.1.0-legacy-susfs
+      KSU_SUSFS_REF: legacy
       SUSFS_BRANCH: gki-android14-6.1
       # --- nubia overlay sources ---
       NUBIA_KERNEL_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650.git
@@ -357,8 +359,15 @@ jobs:
           # for a balanced-power build; CUBIC default is fine.
           {
             echo ''
-            echo '# === custom: balanced power-saving (additive, verified to apply) ==='
+            echo '# === custom: balanced daily-use/power config (additive, verified by post-build audit) ==='
             echo 'CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y'
+            # MGLRU improves page reclaim behaviour under memory pressure. It is
+            # especially useful for Android daily use (many cached apps + zRAM). If
+            # the symbol is already enabled in the base, this is harmless; if a future
+            # tree cannot enable it, the post-build config audit will warn instead of
+            # silently assuming it landed.
+            echo 'CONFIG_LRU_GEN=y'
+            echo 'CONFIG_LRU_GEN_ENABLED=y'
           } >> "$FRAG"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
           #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
@@ -521,6 +530,60 @@ jobs:
             echo "ERROR: CONFIG_IP6_NF_NAT missing from the built GKI Image - common gki_defconfig change did not take effect."
             exit 1
           fi
+
+      - name: Export final kernel config audit artifacts
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set +e
+          AUD="$GITHUB_WORKSPACE/kernel-audit"
+          mkdir -p "$AUD"
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name boot.img -path "*dist*" 2>/dev/null | head -1)")"
+          IMG=""
+          for c in Image Image.gz; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
+          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image -o -name Image.gz \) -path "*dist*" 2>/dev/null | head -1)"
+          if [ -z "$IMG" ]; then
+            echo "WARN: no Image found for config audit" | tee "$AUD/kurumi-config-audit.txt"
+            exit 0
+          fi
+          CFG="$(common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
+          if [ -z "$CFG" ]; then
+            echo "WARN: extract-ikconfig returned empty config" | tee "$AUD/kurumi-config-audit.txt"
+            exit 0
+          fi
+          printf '%s\n' "$CFG" > "$AUD/final.config"
+          rel="$(find out -type f -name kernel.release 2>/dev/null | head -1)"
+          [ -n "$rel" ] && cp -v "$rel" "$AUD/kernel.release" || true
+          find out -type f -name Module.symvers 2>/dev/null | head -1 | xargs -r -I{} cp -v {} "$AUD/Module.symvers"
+          {
+            echo '=== Kurumi final kernel config audit ==='
+            echo "Image: $IMG"
+            [ -f "$AUD/kernel.release" ] && echo "Release: $(cat "$AUD/kernel.release")"
+            echo
+            echo '--- daily-use / memory / scheduler / power ---'
+            for sym in               CONFIG_LRU_GEN CONFIG_LRU_GEN_ENABLED               CONFIG_PSI CONFIG_PSI_DEFAULT_DISABLED               CONFIG_UCLAMP_TASK CONFIG_UCLAMP_TASK_GROUP               CONFIG_ENERGY_MODEL CONFIG_CPU_FREQ_GOV_SCHEDUTIL               CONFIG_CPU_IDLE CONFIG_ARM_PSCI_CPUIDLE               CONFIG_WQ_POWER_EFFICIENT_DEFAULT; do
+              grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
+            done
+            echo
+            echo '--- release/debug visibility audit (not all are bad; inspect before disabling) ---'
+            for sym in               CONFIG_DEBUG_KERNEL CONFIG_DEBUG_FS CONFIG_DYNAMIC_DEBUG               CONFIG_FTRACE CONFIG_FUNCTION_TRACER CONFIG_KPROBES               CONFIG_IRQSOFF_TRACER CONFIG_SCHED_DEBUG CONFIG_LOCKDEP               CONFIG_PROVE_LOCKING CONFIG_KASAN CONFIG_KCSAN CONFIG_UBSAN               CONFIG_DEBUG_PREEMPT CONFIG_DEBUG_SPINLOCK CONFIG_DEBUG_MUTEXES               CONFIG_PM_DEBUG CONFIG_PM_ADVANCED_DEBUG               CONFIG_THERMAL_STATISTICS CONFIG_THERMAL_EMULATION; do
+              grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
+            done
+            echo
+            echo '--- recommendations ---'
+            grep -q '^CONFIG_LRU_GEN=y' "$AUD/final.config" && echo 'OK: MGLRU core enabled' || echo 'WARN: CONFIG_LRU_GEN is not enabled'
+            grep -q '^CONFIG_LRU_GEN_ENABLED=y' "$AUD/final.config" && echo 'OK: MGLRU enabled by default' || echo 'WARN: CONFIG_LRU_GEN_ENABLED is not enabled'
+            grep -q '^CONFIG_PSI=y' "$AUD/final.config" && echo 'OK: PSI enabled' || echo 'WARN: PSI is not enabled'
+            grep -q '^CONFIG_PSI_DEFAULT_DISABLED=y' "$AUD/final.config" && echo 'WARN: PSI_DEFAULT_DISABLED=y' || echo 'OK: PSI not default-disabled'
+          } | tee "$AUD/kurumi-config-audit.txt"
+          exit 0
+
+      - name: Upload kernel config audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kurumi-kernel-config-audit
+          path: kernel-audit/*
+          if-no-files-found: warn
 
       - name: Mark common source baseline for root variants
         working-directory: /mnt/src/kp/kernel_platform
@@ -695,7 +758,7 @@ jobs:
           #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
           
           '''
-          if 'CL_COPY_MNT_NS' not in s:
+          if '#define CL_COPY_MNT_NS' not in s or 'extern bool susfs_is_current_ksu_domain' not in s or 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' not in s:
               anchor = '#include "internal.h"\n\n'
               if anchor not in s:
                   raise SystemExit('namespace repair: internal.h anchor not found')
@@ -729,11 +792,12 @@ jobs:
             fi
           fi
 
-          # 2) Add KSU-Next. Prefer a susfs-tagged KSU-Next ref that already contains
-          # the KSU-side integration. The plain upstream legacy/next trees currently do
-          # not expose CONFIG_KSU_SUSFS by themselves, and susfs4ksu's big KSU-side patch
-          # often rejects against current KSU-Next. Keep the old KSU-side patch only as
-          # an explicit fallback if the selected ref is not pre-integrated.
+          # 2) Add KSU-Next and integrate the KSU-side SuSFS glue.
+          # Use a plain KSU-Next ref (default: legacy) and then apply the matching
+          # susfs4ksu KSU-side patch from the same SUSFS_BRANCH. This keeps the KSU
+          # glue API aligned with the common/fs/susfs.c + include/linux/susfs.h that
+          # were copied above. Pre-integrated *legacy-susfs tags were intentionally
+          # avoided after they produced undeclared susfs_* APIs with this branch.
           ( cd common && rm -rf KernelSU-Next \
               && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
               && ( cd KernelSU-Next \
@@ -755,12 +819,12 @@ jobs:
           KSU_DIR="$(find common -maxdepth 2 -type d \( -name 'KernelSU-Next' -o -name 'KernelSU' \) 2>/dev/null | head -1)"
           KSU_PATCH="$SUS/KernelSU/10_enable_susfs_for_ksu.patch"
           [ -d "$KSU_DIR" ] || { echo "WARN: KernelSU directory not found after setup - KSU+susfs variant skipped."; exit 0; }
+          [ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side susfs patch missing: $KSU_PATCH"; exit 0; }
 
           if grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null; then
-            echo "KSU+susfs: selected KSU-Next ref already exposes CONFIG_KSU_SUSFS; skipping legacy KSU-side patch."
+            echo "KSU+susfs: selected ref already exposes CONFIG_KSU_SUSFS; verifying API compatibility."
           else
-            echo "KSU+susfs: selected KSU-Next ref has no CONFIG_KSU_SUSFS; trying susfs4ksu KSU-side patch fallback."
-            [ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side susfs patch missing: $KSU_PATCH"; exit 0; }
+            echo "KSU+susfs: applying susfs4ksu KSU-side patch to $KSU_DIR"
             cp -v "$KSU_PATCH" "$KSU_DIR/10_enable_susfs_for_ksu.patch"
             ( cd "$KSU_DIR" && patch -p1 --fuzz=3 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
             ksu_sus_rc=$?
@@ -772,6 +836,83 @@ jobs:
               echo "WARN: KSU-side susfs patch did NOT apply cleanly -> KSU+susfs variant skipped."
               exit 0
             fi
+          fi
+
+          repair_ksu_susfs_build_edges() {
+            cat > /tmp/kurumi_fix_ksu_susfs.py <<'PY_FIX_KSU'
+          from pathlib import Path
+          import re
+          
+          # Known fs/namespace.c edge: the first hunk can reject while later hunks applied,
+          # leaving use-sites without the include/extern/#define block.
+          ns = Path('common/fs/namespace.c')
+          if ns.exists():
+              s = ns.read_text()
+              changed = False
+              if '#include <linux/susfs_def.h>' not in s and ('susfs_is_current_ksu_domain' in s or 'susfs_is_sdcard_android_data_not_decrypted' in s):
+                  anchor = '#include <linux/mnt_idmapping.h>\\n'
+                  if anchor in s:
+                      s = s.replace(anchor, anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n#include <linux/susfs_def.h>\\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n', 1)
+                      changed = True
+              need_ns_block = (
+                  ('susfs_is_current_ksu_domain' in s and 'extern bool susfs_is_current_ksu_domain' not in s) or
+                  ('susfs_is_sdcard_android_data_not_decrypted' in s and 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted' not in s) or
+                  ('CL_COPY_MNT_NS' in s and '#define CL_COPY_MNT_NS' not in s)
+              )
+              if need_ns_block:
+                  anchor = '#include "internal.h"\\n\\n'
+                  block = (
+                      '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n'
+                      'extern bool susfs_is_current_ksu_domain(void);\\n'
+                      'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\\n\\n'
+                      '#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\\n\\n'
+                      '#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\\n\\n'
+                  )
+                  if anchor in s:
+                      s = s.replace(anchor, anchor + block, 1)
+                      changed = True
+              if changed:
+                  ns.write_text(s)
+                  print('KSU+susfs repair: fs/namespace.c declarations fixed')
+          
+          # Guard against accidentally using a pre-integrated KSU ref whose supercalls.c
+          # expects a newer SuSFS common API than susfs4ksu/$SUSFS_BRANCH provides.
+          susfs_c = Path('common/fs/susfs.c').read_text() if Path('common/fs/susfs.c').exists() else ''
+          for sc in Path('common/drivers/kernelsu').rglob('supercalls.c'):
+              s = sc.read_text()
+              if 'susfs_' not in s:
+                  continue
+              missing_api = []
+              for name in ('susfs_set_i_state_on_external_dir', 'susfs_add_try_umount'):
+                  if name in s and name not in susfs_c:
+                      missing_api.append(name)
+              if missing_api:
+                  raise SystemExit('KSU+susfs incompatible API in %s: %s. Use plain KSU_SUSFS_REF=legacy + matching susfs4ksu patch, not a mismatched pre-integrated ref.' % (sc, ', '.join(missing_api)))
+              changed = False
+              if '#include <linux/susfs.h>' not in s:
+                  m = re.search(r'^(#include <linux/[^>]+>\\n)+', s, flags=re.M)
+                  if m:
+                      s = s[:m.end()] + '#include <linux/susfs.h>\\n' + s[m.end():]
+                      changed = True
+              replacements = [
+                  (r'pr_info\\("sys_reboot: ppptr: 0x%lx \\\\n",\\s*ppptr\\);', 'pr_info("sys_reboot: ppptr: 0x%lx \\\\n", (unsigned long)ppptr);'),
+                  (r'pr_info\\("sys_reboot: u_pptr: 0x%lx \\\\n",\\s*u_pptr\\);', 'pr_info("sys_reboot: u_pptr: 0x%llx \\\\n", (unsigned long long)u_pptr);'),
+                  (r'pr_info\\("sys_reboot: u_ptr: 0x%lx \\\\n",\\s*u_ptr\\);', 'pr_info("sys_reboot: u_ptr: 0x%llx \\\\n", (unsigned long long)u_ptr);'),
+              ]
+              for pat, repl in replacements:
+                  ns2, n = re.subn(pat, repl, s)
+                  if n:
+                      s = ns2
+                      changed = True
+              if changed:
+                  sc.write_text(s)
+                  print('KSU+susfs repair: %s includes/format fixed' % sc)
+          PY_FIX_KSU
+            python3 /tmp/kurumi_fix_ksu_susfs.py
+          }
+          if ! repair_ksu_susfs_build_edges; then
+            echo "WARN: KSU+susfs source compatibility repair failed -> KSU+susfs variant skipped."
+            exit 0
           fi
 
           grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null || {

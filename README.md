@@ -47,6 +47,15 @@ and no periodic Wi-Fi loop. Only `/sys` + `/proc` + Android shell settings are
 written - reversible, no partition writes, no log file. Requires Magisk (root).
 Revert: reflash stock `init_boot` or choose `Skip` in the installer profile menu.
 
+
+## Kernel-only daily-use changes
+The kernel workflow also applies a small kernel-only daily-use layer:
+
+- `CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y` for lower idle/workqueue overhead where supported.
+- `CONFIG_LRU_GEN=y` and `CONFIG_LRU_GEN_ENABLED=y` are requested so MGLRU is enabled by default when supported by the final GKI config.
+- A `kurumi-kernel-config-audit` artifact is uploaded from the built Image, including `final.config`, `kernel.release`, optional `Module.symvers`, and a release/debug audit for MGLRU, PSI, uclamp, EAS, cpuidle, workqueue and heavy debug symbols.
+- SuSFS variant integration uses plain `KernelSU-Next legacy` plus the matching `susfs4ksu` KSU-side patch instead of mismatched pre-integrated susfs tags.
+
 ## Build identity
 `/proc/version` is forced to `(kurumi@dev)` with the REAL build time by hard-overriding
 `scripts/mkcompile_h`: it sets `KBUILD_BUILD_USER/HOST` and, crucially, `SOURCE_DATE_EPOCH`
