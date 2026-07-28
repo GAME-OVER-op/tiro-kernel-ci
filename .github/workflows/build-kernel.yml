@@ -29,10 +29,11 @@ jobs:
       GKI_COMMON_REPO: https://android.googlesource.com/kernel/common
       GKI_COMMON_BRANCH: android14-6.1
       # --- root variants ---
-      # Keep plain KSU on the fast-moving next branch. For susfs, use the KSU-Next legacy
-      # integration path and apply susfs4ksu's KSU-side + common-side patches explicitly.
+      # Keep plain KSU on the fast-moving next branch. For susfs, prefer a KSU-Next
+      # susfs-tagged ref, because susfs4ksu's KSU-side patch does not apply cleanly
+      # to current plain KSU-Next legacy/next trees anymore.
       KSU_NEXT_REF: next
-      KSU_SUSFS_REF: legacy
+      KSU_SUSFS_REF: v3.1.0-legacy-susfs
       SUSFS_BRANCH: gki-android14-6.1
       # --- nubia overlay sources ---
       NUBIA_KERNEL_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650.git
@@ -665,24 +666,81 @@ jobs:
           [ -f "$SUS_PATCH" ] || { echo "WARN: susfs common patch missing: $SUS_PATCH"; exit 0; }
           cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
           cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
+          repair_susfs_namespace_reject() {
+            # android14-6.1 may only reject the first fs/namespace.c hunk when nearby
+            # includes changed upstream. That hunk only adds susfs include/externs and
+            # CL_COPY_MNT_NS. All later namespace hunks are usually already applied.
+            # Repair this one known-safe reject instead of skipping the whole variant.
+            [ -f common/fs/namespace.c.rej ] || return 1
+            grep -q 'CL_COPY_MNT_NS' common/fs/namespace.c.rej || return 1
+            grep -q 'susfs_def.h' common/fs/namespace.c.rej || return 1
+            python3 <<'PY_REPAIR'
+          from pathlib import Path
+          p = Path('common/fs/namespace.c')
+          s = p.read_text()
+          changed = False
+          if '#include <linux/susfs_def.h>' not in s:
+              anchor = '#include <linux/mnt_idmapping.h>\n'
+              ins = anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+              if anchor not in s:
+                  raise SystemExit('namespace repair: mnt_idmapping include anchor not found')
+              s = s.replace(anchor, ins, 1)
+              changed = True
+          block = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+          
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          
+          #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          
+          '''
+          if 'CL_COPY_MNT_NS' not in s:
+              anchor = '#include "internal.h"\n\n'
+              if anchor not in s:
+                  raise SystemExit('namespace repair: internal.h anchor not found')
+              s = s.replace(anchor, anchor + block, 1)
+              changed = True
+          if changed:
+              p.write_text(s)
+          print('namespace repair: applied' if changed else 'namespace repair: already present')
+          PY_REPAIR
+          }
+
           ( cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_PATCH" )
           sus_rc=$?
-          REJ="$(cd common && find . -name '*.rej' 2>/dev/null)"
+          REJ="$(cd common && find . -name '*.rej' 2>/dev/null | sort)"
           if [ "$sus_rc" != 0 ] || [ -n "$REJ" ]; then
             echo '=================== susfs .rej DUMP (send this to fix susfs next run) ==================='
             for r in $REJ; do echo "----- common/$r -----"; sed -n '1,160p' "common/$r"; done
             echo '========================================================================================'
-            echo "WARN: susfs kernel patch did NOT apply cleanly -> KSU+susfs variant skipped."
-            ( cd common && find . -name '*.rej' -delete; find . -name '*.orig' -delete ) 2>/dev/null
-            exit 0
+            if [ "$REJ" = "./fs/namespace.c.rej" ] && repair_susfs_namespace_reject; then
+              rm -f common/fs/namespace.c.rej
+              REJ="$(cd common && find . -name '*.rej' 2>/dev/null | sort)"
+              if [ -z "$REJ" ]; then
+                echo "KSU+susfs: repaired known fs/namespace.c include hunk reject; continuing."
+                sus_rc=0
+              fi
+            fi
+            if [ "$sus_rc" != 0 ] || [ -n "$REJ" ]; then
+              echo "WARN: susfs kernel patch did NOT apply cleanly -> KSU+susfs variant skipped."
+              ( cd common && find . -name '*.rej' -delete; find . -name '*.orig' -delete ) 2>/dev/null
+              exit 0
+            fi
           fi
 
-          # 2) Add KSU-Next using the legacy integration path, then apply the KSU-side susfs patch.
+          # 2) Add KSU-Next. Prefer a susfs-tagged KSU-Next ref that already contains
+          # the KSU-side integration. The plain upstream legacy/next trees currently do
+          # not expose CONFIG_KSU_SUSFS by themselves, and susfs4ksu's big KSU-side patch
+          # often rejects against current KSU-Next. Keep the old KSU-side patch only as
+          # an explicit fallback if the selected ref is not pre-integrated.
           ( cd common && rm -rf KernelSU-Next \
               && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
-              && ( cd KernelSU-Next && (git checkout "$KSU_SUSFS_REF" || git checkout -b "$KSU_SUSFS_REF" "origin/$KSU_SUSFS_REF") ) )
+              && ( cd KernelSU-Next \
+                   && git fetch --tags --force \
+                   && (git checkout "$KSU_SUSFS_REF" || git checkout "tags/$KSU_SUSFS_REF" || git checkout -b "$KSU_SUSFS_REF" "origin/$KSU_SUSFS_REF") ) )
           KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
-          echo "KernelSU-Next '$KSU_SUSFS_REF' commit count (drives KSU_VERSION): $KSU_CNT"
+          echo "KernelSU-Next susfs ref '$KSU_SUSFS_REF' commit count (drives KSU_VERSION): $KSU_CNT"
           ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_SUSFS_REF" )
           ksu_rc=$?
           if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
@@ -697,21 +755,27 @@ jobs:
           KSU_DIR="$(find common -maxdepth 2 -type d \( -name 'KernelSU-Next' -o -name 'KernelSU' \) 2>/dev/null | head -1)"
           KSU_PATCH="$SUS/KernelSU/10_enable_susfs_for_ksu.patch"
           [ -d "$KSU_DIR" ] || { echo "WARN: KernelSU directory not found after setup - KSU+susfs variant skipped."; exit 0; }
-          [ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side susfs patch missing: $KSU_PATCH"; exit 0; }
-          cp -v "$KSU_PATCH" "$KSU_DIR/10_enable_susfs_for_ksu.patch"
-          ( cd "$KSU_DIR" && patch -p1 --fuzz=3 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
-          ksu_sus_rc=$?
-          KSU_REJ="$(cd "$KSU_DIR" && find . -name '*.rej' 2>/dev/null)"
-          if [ "$ksu_sus_rc" != 0 ] || [ -n "$KSU_REJ" ]; then
-            echo '=================== KSU-side susfs .rej DUMP ==================='
-            for r in $KSU_REJ; do echo "----- $KSU_DIR/$r -----"; sed -n '1,160p' "$KSU_DIR/$r"; done
-            echo '================================================================'
-            echo "WARN: KSU-side susfs patch did NOT apply cleanly -> KSU+susfs variant skipped."
-            exit 0
+
+          if grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null; then
+            echo "KSU+susfs: selected KSU-Next ref already exposes CONFIG_KSU_SUSFS; skipping legacy KSU-side patch."
+          else
+            echo "KSU+susfs: selected KSU-Next ref has no CONFIG_KSU_SUSFS; trying susfs4ksu KSU-side patch fallback."
+            [ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side susfs patch missing: $KSU_PATCH"; exit 0; }
+            cp -v "$KSU_PATCH" "$KSU_DIR/10_enable_susfs_for_ksu.patch"
+            ( cd "$KSU_DIR" && patch -p1 --fuzz=3 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
+            ksu_sus_rc=$?
+            KSU_REJ="$(cd "$KSU_DIR" && find . -name '*.rej' 2>/dev/null)"
+            if [ "$ksu_sus_rc" != 0 ] || [ -n "$KSU_REJ" ]; then
+              echo '=================== KSU-side susfs .rej DUMP ==================='
+              for r in $KSU_REJ; do echo "----- $KSU_DIR/$r -----"; sed -n '1,200p' "$KSU_DIR/$r"; done
+              echo '================================================================'
+              echo "WARN: KSU-side susfs patch did NOT apply cleanly -> KSU+susfs variant skipped."
+              exit 0
+            fi
           fi
 
           grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null || {
-            echo "WARN: KSU_SUSFS Kconfig symbol not found after KSU-side patch - KSU+susfs variant skipped."
+            echo "WARN: KSU_SUSFS Kconfig symbol not found after KSU-side integration - KSU+susfs variant skipped."
             exit 0
           }
           bake_ksu_version
