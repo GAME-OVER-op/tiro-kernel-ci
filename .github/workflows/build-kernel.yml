@@ -29,13 +29,11 @@ jobs:
       GKI_COMMON_REPO: https://android.googlesource.com/kernel/common
       GKI_COMMON_BRANCH: android14-6.1
       # --- root variants ---
-      # Keep plain KSU on the fast-moving next branch. For susfs, use the plain
-      # KSU-Next legacy branch and apply the matching susfs4ksu KSU-side patch from
-      # the same susfs4ksu branch. Avoid pre-integrated *legacy-susfs tags here:
-      # current tags can expect newer/renamed SuSFS APIs than the gki-android14-6.1
-      # common patch provides, which produces undeclared susfs_* symbols.
+      # Keep plain KSU on the fast-moving next branch. For susfs, use a
+      # pre-integrated KernelSU-Next SuSFS ref; the susfs4ksu KSU-side patch targets
+      # KernelSU-style sources and rejects on current KernelSU-Next legacy.
       KSU_NEXT_REF: next
-      KSU_SUSFS_REF: legacy
+      KSU_SUSFS_REF: v3.2.0-legacy-susfs-v2
       SUSFS_BRANCH: gki-android14-6.1
       # --- nubia overlay sources ---
       NUBIA_KERNEL_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650.git
@@ -868,20 +866,22 @@ jobs:
             fi
           fi
 
-          # 2) Add KSU-Next and integrate the KSU-side SuSFS glue.
-          # Use a plain KSU-Next ref (default: legacy) and then apply the matching
-          # susfs4ksu KSU-side patch from the same SUSFS_BRANCH. This keeps the KSU
-          # glue API aligned with the common/fs/susfs.c + include/linux/susfs.h that
-          # were copied above. Pre-integrated *legacy-susfs tags were intentionally
-          # avoided after they produced undeclared susfs_* APIs with this branch.
-          ( cd common && rm -rf KernelSU-Next \
-              && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
-              && ( cd KernelSU-Next \
-                   && git fetch --tags --force \
-                   && (git checkout "$KSU_SUSFS_REF" || git checkout "tags/$KSU_SUSFS_REF" || git checkout -b "$KSU_SUSFS_REF" "origin/$KSU_SUSFS_REF") ) )
+          # 2) Add KernelSU-Next with SuSFS glue.
+          # Do NOT apply susfs4ksu/KernelSU/10_enable_susfs_for_ksu.patch to the
+          # moving KernelSU-Next legacy branch. That patch targets KernelSU-style
+          # sources and currently rejects across Kbuild/Kconfig/core/hook/policy.
+          # Instead use a KernelSU-Next ref that already carries KSU_SUSFS glue,
+          # then combine it with the common/fs SuSFS patch applied above.
+          ( cd common && rm -rf KernelSU-Next               && git clone https://github.com/KernelSU-Next/KernelSU-Next.git               && ( cd KernelSU-Next                    && git fetch --tags --force                    && SELECTED_REF=""                    && for ref in "$KSU_SUSFS_REF" v3.2.0-legacy-susfs-v2 v3.1.0-legacy-susfs legacy-susfs-v2 legacy-susfs; do                         [ -n "$ref" ] || continue;                         if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi;                         if git rev-parse --verify --quiet "origin/$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi;                       done                    && [ -n "$SELECTED_REF" ]                    && echo "$SELECTED_REF" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref"                    && (git checkout "$SELECTED_REF" || git checkout "tags/$SELECTED_REF" || git checkout -b "$SELECTED_REF" "origin/$SELECTED_REF") ) )
+          ksu_pre_rc=$?
+          if [ "$ksu_pre_rc" != 0 ]; then
+            echo "WARN: no usable pre-integrated KernelSU-Next SuSFS ref found (requested '$KSU_SUSFS_REF') - KSU+susfs variant skipped."
+            exit 0
+          fi
+          KSU_SUSFS_SELECTED_REF="$(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" 2>/dev/null || echo "$KSU_SUSFS_REF")"
           KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
-          echo "KernelSU-Next susfs ref '$KSU_SUSFS_REF' commit count (drives KSU_VERSION): $KSU_CNT"
-          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_SUSFS_REF" )
+          echo "KernelSU-Next SuSFS ref '$KSU_SUSFS_SELECTED_REF' commit count (drives KSU_VERSION): $KSU_CNT"
+          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_SUSFS_SELECTED_REF" )
           ksu_rc=$?
           if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
             echo "WARN: KSU-Next susfs history too shallow ($KSU_CNT) -> driver would report v0.0.1. Skipping KSU+susfs variant."
@@ -893,25 +893,12 @@ jobs:
           fi
 
           KSU_DIR="$(find common -maxdepth 2 -type d \( -name 'KernelSU-Next' -o -name 'KernelSU' \) 2>/dev/null | head -1)"
-          KSU_PATCH="$SUS/KernelSU/10_enable_susfs_for_ksu.patch"
           [ -d "$KSU_DIR" ] || { echo "WARN: KernelSU directory not found after setup - KSU+susfs variant skipped."; exit 0; }
-          [ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side susfs patch missing: $KSU_PATCH"; exit 0; }
-
           if grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_DIR" common 2>/dev/null; then
-            echo "KSU+susfs: selected ref already exposes CONFIG_KSU_SUSFS; verifying API compatibility."
+            echo "KSU+susfs: selected KernelSU-Next ref exposes CONFIG_KSU_SUSFS; verifying API compatibility."
           else
-            echo "KSU+susfs: applying susfs4ksu KSU-side patch to $KSU_DIR"
-            cp -v "$KSU_PATCH" "$KSU_DIR/10_enable_susfs_for_ksu.patch"
-            ( cd "$KSU_DIR" && patch -p1 --fuzz=3 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch )
-            ksu_sus_rc=$?
-            KSU_REJ="$(cd "$KSU_DIR" && find . -name '*.rej' 2>/dev/null)"
-            if [ "$ksu_sus_rc" != 0 ] || [ -n "$KSU_REJ" ]; then
-              echo '=================== KSU-side susfs .rej DUMP ==================='
-              for r in $KSU_REJ; do echo "----- $KSU_DIR/$r -----"; sed -n '1,200p' "$KSU_DIR/$r"; done
-              echo '================================================================'
-              echo "WARN: KSU-side susfs patch did NOT apply cleanly -> KSU+susfs variant skipped."
-              exit 0
-            fi
+            echo "WARN: selected KernelSU-Next ref '$KSU_SUSFS_SELECTED_REF' has no CONFIG_KSU_SUSFS - KSU+susfs variant skipped."
+            exit 0
           fi
 
           repair_ksu_susfs_build_edges() {
