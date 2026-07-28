@@ -239,11 +239,27 @@ jobs:
           # default-n symbols, so an explicit "# CONFIG_MODULE_SIG_PROTECT is not set"
           # fails the gate ("savedefconfig does not match"). MODULE_SIG_PROTECT defaults
           # to n, so removing the =y line disables it and still matches savedefconfig.
-          sed -i "/^CONFIG_MODULE_SIG_PROTECT=y/d" "$CDEF"
-          echo "--- common gki_defconfig MODULE_SIG_PROTECT now: ---"
-          grep -n 'MODULE_SIG_PROTECT' "$CDEF" || echo '(symbol absent from common gki_defconfig)'
-          if grep -q '^CONFIG_MODULE_SIG_PROTECT=y' "$CDEF"; then
-            echo 'ERROR: failed to disable MODULE_SIG_PROTECT in common gki_defconfig'; exit 1
+          # Release/daily cleanup for the actual GKI Image config. For COMMON's
+          # gki_defconfig, prefer deleting default-n debug/sanitizer =y lines instead
+          # of writing explicit '# ... is not set' entries: common runs an exact
+          # savedefconfig gate, and savedefconfig omits default-n symbols.
+          sed -i \
+            -e '/^CONFIG_MODULE_SIG_PROTECT=y/d' \
+            -e '/^CONFIG_PM_DEBUG=y/d' \
+            -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
+            -e '/^CONFIG_THERMAL_STATISTICS=y/d' \
+            -e '/^CONFIG_THERMAL_EMULATION=y/d' \
+            -e '/^CONFIG_KASAN=y/d' \
+            -e '/^CONFIG_KASAN_/d' \
+            -e '/^# CONFIG_KASAN_.* is not set$/d' \
+            -e '/^CONFIG_UBSAN=y/d' \
+            -e '/^CONFIG_UBSAN_/d' \
+            -e '/^# CONFIG_UBSAN_.* is not set$/d' \
+            "$CDEF"
+          echo "--- common gki_defconfig release cleanup now: ---"
+          grep -nE 'MODULE_SIG_PROTECT|PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|KASAN|UBSAN' "$CDEF" || echo '(release cleanup symbols absent from common gki_defconfig)'
+          if grep -qE '^(CONFIG_MODULE_SIG_PROTECT|CONFIG_KASAN|CONFIG_UBSAN|CONFIG_PM_DEBUG|CONFIG_THERMAL_STATISTICS|CONFIG_THERMAL_EMULATION)=y' "$CDEF"; then
+            echo 'ERROR: failed to remove active debug/sanitizer/module-protect symbols from common gki_defconfig'; exit 1
           fi
           # ---- kernel name (uname -r) -- injected via LOCALVERSION env, NOT the defconfig ----
           # WHY NOT the defconfig: CONFIG_LOCALVERSION is ABSENT from this branch's common
@@ -335,19 +351,30 @@ jobs:
           #   - PM_ADVANCED_DEBUG: it 'depends on PM_DEBUG'. With PM_DEBUG off it becomes
           #     invisible and vanishes from .config, so we must DELETE its line entirely
           #     (an explicit '# ... is not set' would mismatch and fail gate (2)).
+          #   - KASAN / UBSAN: disable the top-level sanitizer symbol for daily/release builds,
+          #     and DELETE their mode/suboption lines because they become hidden once the
+          #     top-level sanitizer is off. Do not delete HAVE_ARCH_*/CC_HAS_* capability
+          #     symbols: those are harmless capability probes, not active instrumentation.
           #
           # NOTE: the OnePlus-base-only USB_ACM / USB_SERIAL / BT_RFCOMM disables were REMOVED.
           #   They existed solely because the OnePlus common lacked __tty_port_tty_hangup; the
           #   AOSP GKI base exports it, so those stock modules build normally and we keep full
-          #   ABI/module parity with the device. Only the low-risk debug/thermal-off tweaks stay
-          #   (they touch no exported symbol / KMI). PM_ADVANCED_DEBUG depends on PM_DEBUG, so
-          #   once PM_DEBUG is off it vanishes from .config -> delete its line (an explicit
-          #   '# ... is not set' for a hidden symbol would fail the merged-defconfig gate).
+          #   ABI/module parity with the device. Only release-safe debug/thermal/sanitizer-off
+          #   tweaks stay (they touch no exported symbol / KMI). PM_ADVANCED_DEBUG and
+          #   KASAN/UBSAN suboptions become hidden when their parent is off, so delete their
+          #   dependent lines instead of leaving explicit '# ... is not set' entries that
+          #   strict merged-defconfig checks may reject.
           sed -i \
             -e 's/^CONFIG_PM_DEBUG=y/# CONFIG_PM_DEBUG is not set/' \
             -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
             -e 's/^CONFIG_THERMAL_STATISTICS=y/# CONFIG_THERMAL_STATISTICS is not set/' \
             -e 's/^CONFIG_THERMAL_EMULATION=y/# CONFIG_THERMAL_EMULATION is not set/' \
+            -e 's/^CONFIG_KASAN=y/# CONFIG_KASAN is not set/' \
+            -e '/^CONFIG_KASAN_/d' \
+            -e '/^# CONFIG_KASAN_.* is not set$/d' \
+            -e 's/^CONFIG_UBSAN=y/# CONFIG_UBSAN is not set/' \
+            -e '/^CONFIG_UBSAN_/d' \
+            -e '/^# CONFIG_UBSAN_.* is not set$/d' \
             -e 's/^CONFIG_MODULE_SIG_PROTECT=y/# CONFIG_MODULE_SIG_PROTECT is not set/' \
             "$DEF"
 
@@ -415,7 +442,7 @@ jobs:
           grep -nE 'IP6_NF_IPTABLES|IP6_NF_NAT|IP6_NF_TARGET' "$CDEF" || true
 
           echo '--- gki_defconfig debug/thermal lines now: ---'
-          grep -nE 'PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|MODULE_SIG_PROTECT' "$DEF" || true
+          grep -nE 'PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|KASAN|UBSAN|MODULE_SIG_PROTECT' "$DEF" || true
           # Hard guard: the whole boot fix depends on this flip sticking. If the base
           # gki_defconfig still has it =y, the sed missed it -> fail loudly (do NOT ship a
           # kernel that still rejects stock /system_dlkm GKI modules -> boot-anim hang).
