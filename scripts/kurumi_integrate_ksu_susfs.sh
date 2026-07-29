@@ -213,6 +213,7 @@ PY_REPAIR
 cat > /tmp/kurumi_prepare_ksu_susfs_compat.py <<'PY_KSU_COMPAT'
 from pathlib import Path
 import sys
+import re
 
 root = Path('common')
 ksu = root / 'KernelSU-Next' / 'kernel'
@@ -328,61 +329,43 @@ if kb.exists():
         write_if_changed(kb, txt)
 
 compat = ksu / 'kurumi_susfs_compat.c'
-compat_src = '''#include <linux/cred.h>
-#include <linux/fs.h>
-#include <linux/namei.h>
-#include <linux/printk.h>
-#include <linux/static_key.h>
-#include <linux/types.h>
-#include <linux/uaccess.h>
-#include <linux/binfmts.h>
-
-struct user_arg_ptr;
-extern void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);
-
-/*
- * Compatibility bridge for current KernelSU-Next + susfs4ksu android14-6.1.
- * susfs4ksu's common kernel patch calls these inline-hook entry points.
- * Current KernelSU-Next still keeps its normal kprobes/syscall-hook runtime,
- * so these wrappers are intentionally conservative and non-destructive.
- */
-DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);
-DEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);
-
-int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-\t\t\tvoid *argv, void *envp, int *flags)
-{
-\tif (filename_ptr && *filename_ptr && (*filename_ptr)->name)
-\t\tksu_handle_execveat_ksud((*filename_ptr)->name, (struct user_arg_ptr *)argv);
-\treturn 0;
-}
-
-int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
-\t\t\tvoid *argv, void *envp, int *flags)
-{
-\treturn 0;
-}
-
-int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-\t\t\tint *mode, int *flags)
-{
-\treturn 0;
-}
-
-int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
-{
-\treturn 0;
-}
-
-void ksu_handle_sys_read(unsigned int fd)
-{
-}
-
-void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
-{
-}
-'''
+compat_src = '#include <linux/cred.h>\n#include <linux/fs.h>\n#include <linux/namei.h>\n#include <linux/printk.h>\n#include <linux/static_key.h>\n#include <linux/types.h>\n#include <linux/uaccess.h>\n#include <linux/binfmts.h>\n#include <linux/uidgid.h>\n#include <linux/slab.h>\n#include <linux/task_work.h>\n#include <linux/utsname.h>\n#include <linux/version.h>\n\n#include "uapi/supercall.h"\n#include "supercall/supercall.h"\n#include "manager/manager_identity.h"\n#include "sulog/event.h"\n#include "selinux/selinux.h"\n\nstruct user_arg_ptr;\nextern void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);\nextern uint32_t ksuver_override;\n\nDEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);\nDEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);\n\n__attribute__((weak, cold)) int ksu_handle_input_handle_event(unsigned int *type,\n\t\t\tunsigned int *code, int *value)\n{\n\treturn 0;\n}\n\nint ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags)\n{\n\tif (filename_ptr && *filename_ptr && (*filename_ptr)->name)\n\t\tksu_handle_execveat_ksud((*filename_ptr)->name, (struct user_arg_ptr *)argv);\n\treturn 0;\n}\n\nint ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags)\n{\n\treturn 0;\n}\n\nint ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\tint *mode, int *flags)\n{\n\treturn 0;\n}\n\nint ksu_handle_stat(int *dfd, struct filename **filename, int *flags)\n{\n\treturn 0;\n}\n\nvoid ksu_handle_sys_read(unsigned int fd) {}\nvoid ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr) {}\n\nint ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)\n{\n\tvoid __user *uarg = arg ? *arg : NULL;\n\tunsigned long reply = (unsigned long)uarg;\n\n\tif (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2) {\n\t\tint fd = ksu_install_fd();\n\t\tif (uarg && copy_to_user(uarg, &fd, sizeof(fd)))\n\t\t\tpr_warn("install fd reply failed\\n");\n\t\treturn 0;\n\t}\n\tif (magic2 == CHANGE_MANAGER_UID) {\n\t\tif (current_uid().val != 0)\n\t\t\treturn 1;\n\t\tksu_set_manager_appid(cmd);\n\t\tif (uarg && cmd == ksu_get_manager_appid())\n\t\t\tcopy_to_user(uarg, &reply, sizeof(reply));\n\t\treturn 0;\n\t}\n\tif (magic2 == GET_SULOG_DUMP_V2) {\n\t\tif (current_uid().val != 0)\n\t\t\treturn 1;\n\t\tif (!ksu_sulog_handle_compat_dump(uarg) && uarg)\n\t\t\tcopy_to_user(uarg, &reply, sizeof(reply));\n\t\treturn 0;\n\t}\n\tif (magic2 == CHANGE_KSUVER) {\n\t\tif (current_uid().val != 0)\n\t\t\treturn 1;\n\t\tksuver_override = cmd;\n\t\tif (uarg)\n\t\t\tcopy_to_user(uarg, &reply, sizeof(reply));\n\t\treturn 0;\n\t}\n\tif (magic2 == CHANGE_SPOOF_UNAME) {\n\t\tchar release_buf[65];\n\t\tchar version_buf[65];\n\t\tstatic char original_release_buf[65];\n\t\tstatic char original_version_buf[65];\n\t\tuint64_t u_pptr = 0, u_ptr = 0;\n\t\tvoid __user **ppptr = (void __user **)uarg;\n\t\tstruct new_utsname *u;\n\t\tif (current_uid().val != 0 || !ppptr)\n\t\t\treturn 1;\n\t\tif (copy_from_user(&u_pptr, ppptr, sizeof(u_pptr)))\n\t\t\treturn 0;\n\t\tif (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))\n\t\t\treturn 0;\n\t\tif (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)\n\t\t\treturn 0;\n\t\trelease_buf[sizeof(release_buf) - 1] = \'\\0\';\n\t\tif (strncpy_from_user(version_buf, (char __user *)(u_ptr + strlen(release_buf) + 1), sizeof(version_buf)) < 0)\n\t\t\treturn 0;\n\t\tversion_buf[sizeof(version_buf) - 1] = \'\\0\';\n\t\tif (original_release_buf[0] == \'\\0\') {\n\t\t\tstruct new_utsname *u_curr = utsname();\n\t\t\tstrscpy(original_release_buf, u_curr->release, sizeof(original_release_buf));\n\t\t\tstrscpy(original_version_buf, u_curr->version, sizeof(original_version_buf));\n\t\t}\n\t\tif (!strcmp(release_buf, "default") || !strcmp(version_buf, "default")) {\n\t\t\tmemcpy(release_buf, original_release_buf, sizeof(release_buf));\n\t\t\tmemcpy(version_buf, original_version_buf, sizeof(version_buf));\n\t\t}\n\t\tu = utsname();\n\t\tdown_write(&uts_sem);\n\t\tstrscpy(u->release, release_buf, sizeof(u->release));\n\t\tstrscpy(u->version, version_buf, sizeof(u->version));\n\t\tup_write(&uts_sem);\n\t\tif (uarg)\n\t\t\tcopy_to_user(uarg, &reply, sizeof(reply));\n\t\treturn 0;\n\t}\n\treturn 1;\n}\n'
 write_if_changed(compat, compat_src)
+# Export the KernelSU-Next SELinux-hide internals that the common SuSFS
+# selinuxfs/hooks patch references as externs. The upstream SuSFS KSU-side
+# patch would do this, but it no longer applies cleanly to current KSU-Next.
+selhide = ksu / 'feature' / 'selinux_hide.c'
+if selhide.exists():
+    txt = selhide.read_text(errors='ignore')
+    txt = txt.replace('static bool ksu_selinux_hide_enabled __read_mostly = false;', 'bool ksu_selinux_hide_enabled __read_mostly = false;')
+    txt = txt.replace('static bool ksu_selinux_hide_running __read_mostly = false;', 'bool ksu_selinux_hide_running __read_mostly = false;')
+    txt = txt.replace('static struct selinux_state fake_state;', 'struct selinux_state fake_state;')
+    txt = txt.replace('static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);', 'DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);')
+    txt = txt.replace('static struct page *fake_status = NULL;', 'struct page *fake_status = NULL;')
+    txt = re.sub(r'static\s+void\s+initialize_fake_status\s*\(\s*\)', 'void initialize_fake_status(void)', txt)
+    write_if_changed(selhide, txt)
+
+# Add the small SELinux/SID helpers normally supplied by the SuSFS KSU-side patch.
+selc = ksu / 'selinux' / 'selinux.c'
+if selc.exists():
+    txt = selc.read_text(errors='ignore')
+    if 'u32 susfs_ksu_sid __read_mostly' not in txt:
+        txt += '\n\n#ifdef CONFIG_KSU_SUSFS\n#define KERNEL_INIT_DOMAIN "u:r:init:s0"\n#define KERNEL_ZYGOTE_DOMAIN "u:r:zygote:s0"\n#define KERNEL_PRIV_APP_DOMAIN "u:r:priv_app:s0:c512,c768"\n\nu32 susfs_ksu_sid __read_mostly = 0;\nu32 susfs_init_sid __read_mostly = 0;\nu32 susfs_zygote_sid __read_mostly = 0;\nu32 susfs_priv_app_sid __read_mostly = 0;\n\nstatic inline void susfs_set_sid(const char *secctx_name, u32 *out_sid)\n{\n\tint err;\n\tif (!secctx_name || !out_sid)\n\t\treturn;\n\terr = security_secctx_to_secid(secctx_name, strlen(secctx_name), out_sid);\n\tif (err)\n\t\tpr_err("failed setting sid for \'%s\', err: %d\\\\n", secctx_name, err);\n}\n\nbool susfs_is_sid_equal(const struct cred *cred, u32 sid2)\n{\n#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)\n\tconst struct task_security_struct *tsec = selinux_cred(cred);\n#else\n\tconst struct cred_security_struct *tsec = selinux_cred(cred);\n#endif\n\treturn tsec && tsec->sid == sid2;\n}\n\nu32 susfs_get_sid_from_name(const char *secctx_name)\n{\n\tu32 out_sid = 0;\n\tif (secctx_name)\n\t\tsecurity_secctx_to_secid(secctx_name, strlen(secctx_name), &out_sid);\n\treturn out_sid;\n}\n\nu32 susfs_get_current_sid(void) { return current_sid(); }\nbool susfs_is_current_zygote_domain(void) { return unlikely(current_sid() == susfs_zygote_sid); }\nbool susfs_is_current_ksu_domain(void) { return unlikely(current_sid() == susfs_ksu_sid); }\nbool susfs_is_current_init_domain(void) { return unlikely(current_sid() == susfs_init_sid); }\n\nvoid susfs_set_batch_sid(void)\n{\n\tsusfs_set_sid(KERNEL_ZYGOTE_DOMAIN, &susfs_zygote_sid);\n\tsusfs_set_sid(KERNEL_SU_CONTEXT, &susfs_ksu_sid);\n\tsusfs_set_sid(KERNEL_INIT_DOMAIN, &susfs_init_sid);\n\tsusfs_set_sid(KERNEL_PRIV_APP_DOMAIN, &susfs_priv_app_sid);\n}\n#endif /* CONFIG_KSU_SUSFS */\n'
+        write_if_changed(selc, txt)
+
+selh = ksu / 'selinux' / 'selinux.h'
+if selh.exists():
+    txt = selh.read_text(errors='ignore')
+    if 'susfs_is_current_ksu_domain' not in txt:
+        txt = txt.replace('\n#endif', '\n\n#ifdef CONFIG_KSU_SUSFS\nbool susfs_is_sid_equal(const struct cred *cred, u32 sid2);\nu32 susfs_get_sid_from_name(const char *secctx_name);\nu32 susfs_get_current_sid(void);\nvoid susfs_set_batch_sid(void);\nbool susfs_is_current_zygote_domain(void);\nbool susfs_is_current_ksu_domain(void);\nbool susfs_is_current_init_domain(void);\n#endif\n#endif', 1)
+        write_if_changed(selh, txt)
+
+rules = ksu / 'selinux' / 'rules.c'
+if rules.exists():
+    txt = rules.read_text(errors='ignore')
+    if 'susfs_set_batch_sid();' not in txt and 'reset_avc_cache();' in txt:
+        txt = txt.replace('reset_avc_cache();', 'reset_avc_cache();\n#ifdef CONFIG_KSU_SUSFS\n\tsusfs_set_batch_sid();\n#endif', 1)
+        write_if_changed(rules, txt)
 
 init = ksu / 'core' / 'init.c'
 if init.exists():
