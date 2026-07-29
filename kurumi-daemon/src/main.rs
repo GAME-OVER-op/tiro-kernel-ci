@@ -16,6 +16,13 @@
 //     - cpufreq floor/ceiling pinned per cluster to the true HW min/max OPP
 //       (undo powerHAL/perfd raising scaling_min above the hardware minimum).
 //     - vm.max_map_count = 1048576 (headroom for Wine/Winlator emulators).
+//     - apply_surfaceflinger(): move every surfaceflinger thread from cpuset
+//       system-background ("0-1,5-6" on this ROM) to foreground ("0-7"), and
+//       raise the Adreno idle_timer from 80 to 120 ms. Immediate effect, lasts
+//       until reboot, nothing restarted.
+//     - apply_io_profile(): UFS + block read-ahead profile.
+//     - apply_wifi_sleep_profile(): Android Wi-Fi sleep knobs plus WLAN direct
+//       wakeup policy (eco/balance = delayed push, full = soft push).
 //   Event-driven:
 //     - touch-boost: block-read /dev/input/event* in threads (~0 CPU idle);
 //       on input, pulse /proc/sys/walt/sched_user_hint (auto-decays), debounced.
@@ -29,7 +36,7 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -91,6 +98,14 @@ fn write_if_diff<P: AsRef<Path>>(path: P, val: &str) -> bool {
         }
     }
     write_val(p, val)
+}
+
+fn run_cmd(cmd: &str, args: &[&str]) {
+    let _ = Command::new(cmd).args(args).output();
+}
+
+fn put_global_setting(key: &str, val: &str) {
+    run_cmd("settings", &["put", "global", key, val]);
 }
 
 // ---------- one-time: thermal burn-mode (faithful port of mora) ----------
@@ -217,6 +232,204 @@ fn apply_memory() {
     write_if_diff("/proc/sys/vm/max_map_count", "1048576");
 }
 
+// ---------- one-time: UFS + block read-ahead profile ----------
+// The daemon is launched by init.kurumi.rc only after sys.boot_completed=1.
+// main() then sleeps BOOT_WAIT_SECS (90s). This means these I/O tunables are
+// applied only once, after boot_completed + 90s, after vendor init has settled.
+// No screen polling / idle loop is needed.
+//
+// auto_hibern8 is deliberately NOT touched: on this device it reads blank and
+// rejects writes. clkgate_enable and clkscale_enable were verified writable.
+//
+// Profile policy:
+//   eco:     let UFS save power, low read-ahead.
+//   balance: stock-like post-boot policy.
+//   full:    keep UFS clock gating enabled so it can sleep while idle/screen-off,
+//            but disable clock scaling for lower I/O latency under load.
+
+#[cfg(feature = "eco")]
+const IO_UFS_CLKGATE: &str = "1";
+#[cfg(feature = "eco")]
+const IO_UFS_CLKSCALE: &str = "1";
+#[cfg(feature = "eco")]
+const IO_READ_AHEAD_KB: &str = "128";
+
+#[cfg(feature = "balance")]
+const IO_UFS_CLKGATE: &str = "1";
+#[cfg(feature = "balance")]
+const IO_UFS_CLKSCALE: &str = "1";
+#[cfg(feature = "balance")]
+const IO_READ_AHEAD_KB: &str = "512";
+
+#[cfg(feature = "full")]
+const IO_UFS_CLKGATE: &str = "1";
+#[cfg(feature = "full")]
+const IO_UFS_CLKSCALE: &str = "0";
+#[cfg(feature = "full")]
+const IO_READ_AHEAD_KB: &str = "2048";
+
+const UFS_BASES: &[&str] = &[
+    "/sys/devices/platform/soc/1d84000.ufshc",
+    "/sys/bus/platform/devices/1d84000.ufshc",
+];
+
+fn apply_ufs_policy() {
+    // The two UFS paths are aliases on this device. Write the first existing
+    // one only to avoid duplicate work.
+    for base in UFS_BASES {
+        let base = Path::new(base);
+        if !base.exists() {
+            continue;
+        }
+        write_if_diff(base.join("clkgate_enable"), IO_UFS_CLKGATE);
+        write_if_diff(base.join("clkscale_enable"), IO_UFS_CLKSCALE);
+        break;
+    }
+}
+
+fn is_target_block_device(name: &str) -> bool {
+    name.starts_with("dm-")
+        || name.starts_with("sd")
+        || name.starts_with("mmcblk")
+        || name.starts_with("nvme")
+}
+
+fn apply_read_ahead() {
+    if let Ok(entries) = fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_target_block_device(&name) {
+                continue;
+            }
+            write_if_diff(
+                entry.path().join("queue").join("read_ahead_kb"),
+                IO_READ_AHEAD_KB,
+            );
+        }
+    }
+}
+
+fn apply_io_profile() {
+    apply_ufs_policy();
+    apply_read_ahead();
+}
+
+// ---------- one-time: Wi-Fi sleep / push policy ----------
+// Real sleep-probe data from this device pointed at WLAN/qcom_rx_wakelock and
+// Google/network location wakeups, not UFS or the Rust loop. We keep Wi-Fi ON,
+// but remove background scan / forced-performance knobs and choose how strongly
+// WLAN may wake the AP from suspend.
+//
+// Applied once after boot_completed + 90s, together with the other profile
+// tunables. There is deliberately NO screen polling and NO periodic Wi-Fi loop.
+//
+// Policy:
+//   eco/balance: delayed push. Disable direct WLAN endpoint wakeup only; do not
+//                disable the PCIe parent chain, so Wi-Fi is not killed. Pushes
+//                may arrive during Doze maintenance windows / next wake.
+//   full:        soft push. Keep/re-enable direct WLAN wakeup so notifications
+//                are close to stock, but still clear scan/perf knobs.
+
+#[cfg(any(feature = "eco", feature = "balance"))]
+const WIFI_DIRECT_WAKEUP: &str = "disabled";
+#[cfg(feature = "full")]
+const WIFI_DIRECT_WAKEUP: &str = "enabled";
+
+const WIFI_NETDEVS: &[&str] = &["wlan0", "wifi-aware0", "wlan1"];
+
+fn apply_android_wifi_sleep_knobs() {
+    // Keep Wi-Fi connected. These only reduce extra background radio activity.
+    put_global_setting("mobile_data_always_on", "0");
+    put_global_setting("wifi_scan_always_enabled", "0");
+    put_global_setting("ble_scan_always_enabled", "0");
+    put_global_setting("wifi_wakeup_enabled", "0");
+    put_global_setting("wifi_networks_available_notification_on", "0");
+    put_global_setting("network_recommendations_enabled", "0");
+
+    // AOSP Wi-Fi shell knobs. Missing/unsupported commands are harmless.
+    run_cmd("cmd", &["wifi", "set-scan-always-available", "disabled"]);
+    run_cmd("cmd", &["wifi", "set-verbose-logging", "disabled"]);
+    run_cmd("cmd", &["wifi", "force-hi-perf-mode", "disabled"]);
+    run_cmd("cmd", &["wifi", "force-low-latency-mode", "disabled"]);
+}
+
+fn wlan_direct_wakeup_nodes() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dev in WIFI_NETDEVS {
+        let link = Path::new("/sys/class/net").join(dev).join("device");
+        if !link.exists() {
+            continue;
+        }
+        let target = fs::canonicalize(&link).unwrap_or(link);
+        let node = target.join("power").join("wakeup");
+        if !node.exists() {
+            continue;
+        }
+        if !out.iter().any(|p| p == &node) {
+            out.push(node);
+        }
+    }
+    out
+}
+
+fn apply_wlan_direct_wakeup_policy() {
+    for node in wlan_direct_wakeup_nodes() {
+        write_if_diff(node, WIFI_DIRECT_WAKEUP);
+    }
+}
+
+fn apply_wifi_sleep_profile() {
+    apply_android_wifi_sleep_knobs();
+    apply_wlan_direct_wakeup_policy();
+}
+
+// ---------- one-time: SurfaceFlinger placement + GPU idle timer ----------
+// Measured on this device (NX769J / RedMagic 9 Pro): surfaceflinger sits in
+// cpuset system-background, which this ROM pins to "0-1,5-6". It therefore
+// never gets the mid cluster (cpu2-4) nor the prime core (cpu7), while
+// cpuset foreground is "0-7". Composition is latency-critical and bursty
+// (~8.33ms budget at 120Hz), so the same work on slower cores simply shows up
+// as a higher CPU percentage. Moving it to foreground gives it all 8 cores.
+//
+// kgsl idle_timer 80 -> 120 ms: with continuous client composition (a PiP
+// window drags every layer below it into GPU composition) the 80ms timer makes
+// the GPU drop to its lowest OPP between bursts and ramp back up again.
+//
+// Both writes take effect immediately and last until reboot. Nothing is
+// restarted. Deliberately one-time only, NOT part of any periodic re-check:
+// cpuset membership is per-thread and only needs setting once per SF lifetime.
+
+fn sf_pid() -> Option<u32> {
+    // /proc scan instead of shelling out to `pidof`.
+    for e in fs::read_dir("/proc").ok()?.flatten() {
+        let pid: u32 = match e.file_name().to_string_lossy().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Ok(cmd) = fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+            if cmd.trim_end_matches('\0').ends_with("surfaceflinger") {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn apply_surfaceflinger() {
+    // cpuset: every thread must be moved individually, the group is not
+    // inherited by already-running threads.
+    if let Some(pid) = sf_pid() {
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", pid)) {
+            for t in tasks.flatten() {
+                let tid = t.file_name().to_string_lossy().to_string();
+                let _ = fs::write("/dev/cpuset/foreground/tasks", &tid);
+            }
+        }
+    }
+
+    write_if_diff("/sys/class/kgsl/kgsl-3d0/idle_timer", "120");
+}
+
 // ---------- one-time + periodic: cpufreq floor / ceiling ----------
 // On init powerHAL/perfd raises scaling_min_freq one or two OPP steps above the
 // true hardware minimum, which wastes idle power. mora pins each cluster back to
@@ -261,8 +474,15 @@ const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
     (7, "480000", "2311680"),
 ];
 
-// Refuse to build a daemon with no profile selected.
+// Refuse to build a daemon with no profile selected or with multiple profiles.
 #[cfg(not(any(feature = "eco", feature = "balance", feature = "full")))]
+compile_error!("select exactly one profile feature: eco | balance | full");
+
+#[cfg(any(
+    all(feature = "eco", feature = "balance"),
+    all(feature = "eco", feature = "full"),
+    all(feature = "balance", feature = "full")
+))]
 compile_error!("select exactly one profile feature: eco | balance | full");
 
 fn apply_cpufreq_limits() {
@@ -364,6 +584,9 @@ fn main() {
     apply_core_ctl();
     apply_cpufreq_limits();
     apply_memory();
+    apply_surfaceflinger();
+    apply_io_profile();
+    apply_wifi_sleep_profile();
 
     // Burst: re-assert WALT/VM every 60s for the first 20 min (WALT governor is
     // late; idempotent writes settle once its sysfs dir appears).

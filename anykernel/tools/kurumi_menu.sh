@@ -1,11 +1,11 @@
 #
 # Kurumi Kernel - interactive flash-time menu (getevent / keycheck driven)
 # Sourced by anykernel.sh AFTER tools/ak3-core.sh so ui_print/$bin/abort exist.
-# Exports: KKSU (0|1), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing), KGPU (0|1)
+# Exports: KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing), KGPU (0|1)
 #
 # Key model ($FUNCTION returns 0 for Vol Up, 1 for Vol Down):
 #   binary menus  -> Vol Up = Yes/first  | Vol Down = No/second
-#   profile menu  -> Vol Down = move the '>' cursor | Vol Up = select pointed item
+#   scrolling menus -> Vol Down = move the '>' cursor | Vol Up = select pointed item
 #
 
 ui_print " ";
@@ -62,25 +62,47 @@ else
   $FUNCTION "DOWN";
 fi;
 
-# ---- 0) Root: KernelSU-Next + susfs (asked only if the KSU image is in the zip) ----
-if [ -f "$home/files/image/kurumi_ksu" ]; then
+# ---- 0) Kernel variant (scrolling cursor menu) ----
+# CI may ship up to three real Images:
+#   kurumi_stock      = no root
+#   kurumi_ksu        = KernelSU-Next only
+#   kurumi_ksu_susfs  = KernelSU-Next + susfs
+ui_print " ";
+ui_print "------------------------------";
+ui_print " Kernel variant";
+ui_print "   Vol Down = move cursor";
+ui_print "   Vol Up   = select";
+ui_print "------------------------------";
+KR_IDX=0;
+while true; do
   ui_print " ";
-  ui_print "------------------------------";
-  ui_print " Root: install KernelSU-Next?";
-  ui_print "   (KSU-Next; susfs if built this release)";
-  ui_print "   Vol+ = Yes  (install KSU kernel)";
-  ui_print "   Vol- = No   (clean stock kernel)";
-  ui_print "------------------------------";
-  if $FUNCTION; then
-    KKSU=1;
-    ui_print " " "   -> KernelSU-Next + susfs selected";
-  else
-    KKSU=0;
-    ui_print " " "   -> Stock kernel (no root) selected";
+  if [ $KR_IDX -eq 0 ]; then ui_print " > Stock        - no root"; else ui_print "   Stock        - no root"; fi;
+  if [ -f "$home/files/image/kurumi_ksu" ]; then
+    if [ $KR_IDX -eq 1 ]; then ui_print " > KernelSU     - root only"; else ui_print "   KernelSU     - root only"; fi;
   fi;
-else
-  KKSU=0;
-fi;
+  if [ -f "$home/files/image/kurumi_ksu_susfs" ]; then
+    if [ $KR_IDX -eq 2 ]; then ui_print " > KSU + susfs  - root + susfs"; else ui_print "   KSU + susfs  - root + susfs"; fi;
+  fi;
+  if $FUNCTION; then
+    break;
+  else
+    KR_IDX=$((KR_IDX + 1));
+    # Skip unavailable items while still keeping stable indexes: 0=stock, 1=ksu, 2=susfs.
+    while true; do
+      [ $KR_IDX -gt 2 ] && KR_IDX=0;
+      [ $KR_IDX -eq 0 ] && break;
+      [ $KR_IDX -eq 1 ] && [ -f "$home/files/image/kurumi_ksu" ] && break;
+      [ $KR_IDX -eq 2 ] && [ -f "$home/files/image/kurumi_ksu_susfs" ] && break;
+      KR_IDX=$((KR_IDX + 1));
+    done;
+  fi;
+done;
+case $KR_IDX in
+  1) KROOT=ksu;;
+  2) KROOT=susfs;;
+  *) KROOT=stock;;
+esac;
+ui_print " " "   -> kernel: $KROOT";
 
 # ---- 1) Battery daemon profile (scrolling cursor menu; 'Skip' = do not install it) ----
 # The daemon runs only under Magisk (its overlay.d rc is imported by magiskinit). On
@@ -95,9 +117,9 @@ ui_print "------------------------------";
 KP_IDX=0;
 while true; do
   ui_print " ";
-  if [ $KP_IDX -eq 0 ]; then ui_print " > Economy - max battery (big -60%, mid -30%, little -20%)"; else ui_print "   Economy - max battery (big -60%, mid -30%, little -20%)"; fi;
-  if [ $KP_IDX -eq 1 ]; then ui_print " > Balance - mid -20%, big -30%, little untouched"; else ui_print "   Balance - mid -20%, big -30%, little untouched"; fi;
-  if [ $KP_IDX -eq 2 ]; then ui_print " > Full    - no CPU limits (default)"; else ui_print "   Full    - no CPU limits (default)"; fi;
+  if [ $KP_IDX -eq 0 ]; then ui_print " > Economy - max battery + delayed push"; else ui_print "   Economy - max battery + delayed push"; fi;
+  if [ $KP_IDX -eq 1 ]; then ui_print " > Balance - balanced CPU + delayed push"; else ui_print "   Balance - balanced CPU + delayed push"; fi;
+  if [ $KP_IDX -eq 2 ]; then ui_print " > Full    - no CPU limits + soft push"; else ui_print "   Full    - no CPU limits + soft push"; fi;
   if [ $KP_IDX -eq 3 ]; then ui_print " > Skip    - do not install the battery daemon"; else ui_print "   Skip    - do not install the battery daemon"; fi;
   if $FUNCTION; then
     break;

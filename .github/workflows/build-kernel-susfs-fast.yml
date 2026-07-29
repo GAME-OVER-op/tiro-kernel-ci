@@ -1,4 +1,4 @@
-name: Build tiro KERNEL (NX769J) - standalone Kleaf
+name: Build tiro KERNEL SuSFS FAST (NX769J)
 
 # Standalone QCOM Kleaf/Bazel kernel build for Nubia/RedMagic tiro (NX769J, SM8650 / pineapple).
 # Base GKI = pristine AOSP kernel/common android14-6.1 (the SAME GKI branch the device's stock /
@@ -83,40 +83,6 @@ jobs:
             bc bison build-essential ccache curl flex git git-lfs gnupg gperf \
             libelf-dev liblz4-tool libssl-dev libxml2-utils lzop rsync zip \
             zlib1g-dev python3 python-is-python3
-
-      - name: Build Kurumi Rust daemon (static aarch64, replaces the shell kurumi_battery)
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -e
-          # The daemon is a USERSPACE binary shipped in the AnyKernel overlay.d ramdisk and
-          # launched by Magisk on boot_completed. It touches NO kernel source and does not affect
-          # the kernel build -- it only writes /sys + /proc at runtime (fully reversible).
-          # Android uses bionic (not glibc), so we build a FULLY STATIC musl binary that runs
-          # with no libc dependency. Pure-std crate -> the glibc aarch64 gcc is fine as the
-          # linker driver; Rust's self-contained musl provides crt + libc for the static link.
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          rustup target add aarch64-unknown-linux-musl
-          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-          export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
-          cd kurumi-daemon
-          # Build all THREE profiles from the single source. CPU, I/O and Wi-Fi
-          # sleep/push policy are selected by cargo feature (eco|balance|full).
-          # The flasher installs whichever one the user picks at flash time.
-          BINDIR="$GITHUB_WORKSPACE/anykernel/files/kurumi_bin"
-          mkdir -p "$BINDIR"
-          for p in eco balance full; do
-            echo "=== building kurumi profile: $p ==="
-            cargo build --release --target aarch64-unknown-linux-musl --no-default-features --features "$p"
-            BIN=target/aarch64-unknown-linux-musl/release/kurumi
-            [ -f "$BIN" ] || { echo "ERROR: kurumi ($p) binary not produced"; exit 1; }
-            aarch64-linux-gnu-strip "$BIN" || true
-            file "$BIN"
-            file "$BIN" | grep -q 'ARM aarch64'      || { echo "ERROR: $p daemon is not an aarch64 binary"; exit 1; }
-            file "$BIN" | grep -q 'statically linked' || { echo "ERROR: $p daemon is not statically linked"; exit 1; }
-            install -D -m0755 "$BIN" "$BINDIR/kurumi_$p"
-            rm -f "$BIN"   # force a clean relink for the next feature set
-          done
-          echo '--- built profile binaries ---'; ls -la "$BINDIR"
 
       - name: Install the 'repo' tool
         run: |
@@ -466,368 +432,101 @@ jobs:
             || echo 'WARN: MODULE_SIG_PROTECT absent from base gki_defconfig; may be forced elsewhere - verify resolved .config'
           echo '--- vendor fragment tail: ---'; tail -n 8 "$FRAG"
 
-      - name: Build kernel (standalone Kleaf/Bazel)
-        working-directory: /mnt/src/kp/kernel_platform
-        env:
-          # Injected into the kernel release string by setlocalversion; forwarded into the Bazel
-          # action sandbox by --action_env=LOCALVERSION below. Leading '-' is required.
-          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
-        run: |
-          set -e
-          # Cap concurrency + RAM budget so the peak (LTO link of vmlinux + parallel
-          # module/image actions) stays within RAM+swap and does not OOM-kill the
-          # runner. build_with_bazel.py forwards unknown flags verbatim to `bazel
-          # build` (argparse parse_known_args), so these reach Bazel directly.
-          # KBUILD_BUILD_TIMESTAMP overrides the reproducible-build epoch-0 (1970) default so the
-          # real CI time lands in /proc/version. Its value has SPACES and COLONS ('Wed Jul 15
-          # 16:35:20 UTC 2026'); build_with_bazel.py re-joins forwarded args into ONE shell string,
-          # so passing --action_env=KBUILD_BUILD_TIMESTAMP="..." gets space-split and Bazel mistakes
-          # '16:35:20' for a target (': not allowed'). FIX: export the var and use the NAME-ONLY
-          # form --action_env=KBUILD_BUILD_TIMESTAMP -- Bazel then reads it from the environment and
-          # the value never touches the command line. This is the same pattern that already works
-          # for USER/HOST (set at job level, forwarded name-only).
-          BUILD_TS="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
-          export KBUILD_BUILD_TIMESTAMP="$BUILD_TS"
-          echo "--- stamping build: ts='$BUILD_TS' user='${KBUILD_BUILD_USER:-}' host='${KBUILD_BUILD_HOST:-}' ---"
-          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
-            --jobs=2 --local_ram_resources=9830 \
-            --nokleaf_localversion \
-            --action_env=LOCALVERSION \
-            --action_env=KBUILD_BUILD_USER \
-            --action_env=KBUILD_BUILD_HOST \
-            --action_env=KBUILD_BUILD_TIMESTAMP
 
-      - name: Stash stock kernel Image (variant 1 of 3)
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          set -e
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
-          IMG=""
-          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
-          [ -n "$IMG" ] || { echo 'ERROR: stock kernel Image not found'; exit 1; }
-          mkdir -p "$GITHUB_WORKSPACE/kimg"
-          cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_stock"
-          basename "$IMG" > "$GITHUB_WORKSPACE/kimg/imgname"
-          echo "stashed stock image: $IMG (flash name $(cat "$GITHUB_WORKSPACE/kimg/imgname"))"
-
-      - name: Print kernel release string (diagnostic, non-fatal)
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          set +e
-          echo '=== resolved kernel release (uname -r) as built ==='
-          rel="$(find out -type f -name kernel.release 2>/dev/null | head -n1)"
-          if [ -n "$rel" ]; then
-            echo "KERNEL RELEASE: $(cat "$rel")"
-          else
-            img="$(find out -type f \( -name Image -o -name Image.gz \) 2>/dev/null | head -n1)"
-            if [ -n "$img" ]; then
-              case "$img" in
-                *.gz) banner="$(zcat "$img" 2>/dev/null | strings -a | grep -m1 'Linux version')" ;;
-                *)    banner="$(strings -a "$img" | grep -m1 'Linux version')" ;;
-              esac
-              echo "KERNEL BANNER: ${banner:-<not found>}"
-            else
-              echo 'WARN: no kernel.release or Image found to read version from'
-            fi
-          fi
-          echo '=== expected pattern: 6.1.*-android14-11-kurumi-dev-GAME-OVER-op ==='
-          echo '=== moving GKI base is OK as long as KMI marker/localversion stay correct ==='
-          exit 0
-
-      - name: Verify MODULE_SIG_PROTECT is OFF in the built kernel
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          set -e
-          # Extract the config baked into the produced Image and PROVE the fix
-          # took effect. If the GKI build force-re-enabled MODULE_SIG_PROTECT the
-          # boot.img would hang again -> FAIL here instead of shipping it. This
-          # turns "flash and find out" into a CI assertion (no brick risk).
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name boot.img -path "*dist*" 2>/dev/null | head -1)")"
-          IMG=""
-          for c in Image Image.gz; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image -o -name Image.gz \) -path "*dist*" 2>/dev/null | head -1)"
-          [ -n "$IMG" ] || { echo "ERROR: no kernel Image found to verify"; exit 1; }
-          echo "verifying config baked into: $IMG"
-          CFG="$(common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
-          if [ -z "$CFG" ]; then echo "WARN: extract-ikconfig empty (IKCONFIG missing?) - cannot assert; continuing"; exit 0; fi
-          echo "$CFG" | grep -E 'CONFIG_MODULE_SIG(_PROTECT)?=' || true
-          if echo "$CFG" | grep -q '^CONFIG_MODULE_SIG_PROTECT=y'; then
-            echo "ERROR: built kernel STILL has CONFIG_MODULE_SIG_PROTECT=y - GKI force-enabled it."
-            echo "       Do NOT flash this boot.img; switch to flashing a matching system_dlkm."
-            exit 1
-          fi
-          echo "OK: CONFIG_MODULE_SIG_PROTECT is disabled in the built kernel Image."
-          # IPv6 legacy NAT MUST now be baked into the flashed GKI Image (enabled in the common
-          # gki_defconfig). On-device /proc/config.gz proved every dependency is met, so absence
-          # here means the common-defconfig edit did not reach the Image -> fail before flashing.
-          echo "$CFG" | grep -E 'CONFIG_IP6_NF_NAT=' || true
-          if echo "$CFG" | grep -q '^CONFIG_IP6_NF_NAT=y'; then
-            echo "OK: CONFIG_IP6_NF_NAT=y is in the built kernel Image (ip6tables -t nat will work)."
-          else
-            echo "ERROR: CONFIG_IP6_NF_NAT missing from the built GKI Image - common gki_defconfig change did not take effect."
-            exit 1
-          fi
-
-      - name: Export final kernel config audit artifacts
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          set +e
-          AUD="$GITHUB_WORKSPACE/kernel-audit"
-          mkdir -p "$AUD"
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name boot.img -path "*dist*" 2>/dev/null | head -1)")"
-          IMG=""
-          for c in Image Image.gz; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image -o -name Image.gz \) -path "*dist*" 2>/dev/null | head -1)"
-          if [ -z "$IMG" ]; then
-            echo "WARN: no Image found for config audit" | tee "$AUD/kurumi-config-audit.txt"
-            exit 0
-          fi
-          CFG="$(common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
-          if [ -z "$CFG" ]; then
-            echo "WARN: extract-ikconfig returned empty config" | tee "$AUD/kurumi-config-audit.txt"
-            exit 0
-          fi
-          printf '%s\n' "$CFG" > "$AUD/final.config"
-          rel="$(find out -type f -name kernel.release 2>/dev/null | head -1)"
-          [ -n "$rel" ] && cp -v "$rel" "$AUD/kernel.release" || true
-          find out -type f -name Module.symvers 2>/dev/null | head -1 | xargs -r -I{} cp -v {} "$AUD/Module.symvers"
-          {
-            echo '=== Kurumi final kernel config audit ==='
-            echo "Image: $IMG"
-            [ -f "$AUD/kernel.release" ] && echo "Release: $(cat "$AUD/kernel.release")"
-            echo
-            echo '--- daily-use / memory / scheduler / power ---'
-            for sym in               CONFIG_LRU_GEN CONFIG_LRU_GEN_ENABLED               CONFIG_PSI CONFIG_PSI_DEFAULT_DISABLED               CONFIG_UCLAMP_TASK CONFIG_UCLAMP_TASK_GROUP               CONFIG_ENERGY_MODEL CONFIG_CPU_FREQ_GOV_SCHEDUTIL               CONFIG_CPU_IDLE CONFIG_ARM_PSCI_CPUIDLE               CONFIG_WQ_POWER_EFFICIENT_DEFAULT; do
-              grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
-            done
-            echo
-            echo '--- release/debug visibility audit (not all are bad; inspect before disabling) ---'
-            for sym in               CONFIG_DEBUG_KERNEL CONFIG_DEBUG_FS CONFIG_DYNAMIC_DEBUG               CONFIG_FTRACE CONFIG_FUNCTION_TRACER CONFIG_KPROBES               CONFIG_IRQSOFF_TRACER CONFIG_SCHED_DEBUG CONFIG_LOCKDEP               CONFIG_PROVE_LOCKING CONFIG_KASAN CONFIG_KCSAN CONFIG_UBSAN               CONFIG_DEBUG_PREEMPT CONFIG_DEBUG_SPINLOCK CONFIG_DEBUG_MUTEXES               CONFIG_PM_DEBUG CONFIG_PM_ADVANCED_DEBUG               CONFIG_THERMAL_STATISTICS CONFIG_THERMAL_EMULATION; do
-              grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
-            done
-            echo
-            echo '--- recommendations ---'
-            grep -q '^CONFIG_LRU_GEN=y' "$AUD/final.config" && echo 'OK: MGLRU core enabled' || echo 'WARN: CONFIG_LRU_GEN is not enabled'
-            grep -q '^CONFIG_LRU_GEN_ENABLED=y' "$AUD/final.config" && echo 'OK: MGLRU enabled by default' || echo 'WARN: CONFIG_LRU_GEN_ENABLED is not enabled'
-            grep -q '^CONFIG_PSI=y' "$AUD/final.config" && echo 'OK: PSI enabled' || echo 'WARN: PSI is not enabled'
-            grep -q '^CONFIG_PSI_DEFAULT_DISABLED=y' "$AUD/final.config" && echo 'WARN: PSI_DEFAULT_DISABLED=y' || echo 'OK: PSI not default-disabled'
-          } | tee "$AUD/kurumi-config-audit.txt"
-          exit 0
-
-      - name: Upload kernel config audit artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kurumi-kernel-config-audit
-          path: kernel-audit/*
-          if-no-files-found: warn
-
-      - name: Mark common source baseline for root variants
+      - name: Mark common source baseline for SuSFS fast build
         working-directory: /mnt/src/kp/kernel_platform
         run: |
           set -e
           mkdir -p "$GITHUB_WORKSPACE/kimg"
-          # Snapshot the already-patched common tree after the stock build. Root variants are built
-          # from this exact baseline so stock, KSU, and KSU+susfs differ only by root/susfs code.
+          # Fast workflow builds only KSU+SuSFS. Snapshot the customized common tree
+          # immediately and let kurumi_integrate_ksu_susfs.sh reset to this baseline.
           git -C common add -A
-          git -C common commit -m "kurumi base before root variants" || true
+          git -C common commit -m "kurumi base before fast susfs variant" || true
           git -C common rev-parse HEAD > "$GITHUB_WORKSPACE/kimg/common_base_commit"
-          echo "common baseline: $(cat "$GITHUB_WORKSPACE/kimg/common_base_commit")"
+          echo "fast SuSFS common baseline: $(cat "$GITHUB_WORKSPACE/kimg/common_base_commit")"
 
-      - name: Integrate KernelSU-Next only (variant 2 prep, non-fatal)
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          set +e
-          set -x
-          rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
-          BASE="$(cat "$GITHUB_WORKSPACE/kimg/common_base_commit" 2>/dev/null)"
-          [ -n "$BASE" ] || { echo "WARN: common baseline missing - skipping KSU variant"; exit 0; }
-          git -C common reset --hard "$BASE"
-          git -C common clean -ffd
-
-          bake_ksu_version() {
-            KB="$(find . -path '*KernelSU-Next/kernel/Kbuild' 2>/dev/null | head -1)"
-            KSU_TAG="$(cd common/KernelSU-Next 2>/dev/null && git describe --tags --abbrev=0 2>/dev/null || echo v1.0.0)"
-            if [ -n "$KB" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
-              echo "--- Kbuild version block BEFORE bake ($KB) ---"
-              grep -nE 'KSU_GIT_VERSION|KSU_VERSION|KSU_GIT_TAG|30000|FALLBACK' "$KB" || true
-              awk -v cnt="$KSU_CNT" -v tag="$KSU_TAG" '
-                /^# Check if this is a git repository/ && !injected {
-                  print "# --- Kurumi: hardcoded version for hermetic Kleaf build (no .git/network) ---"
-                  print "KSU_GIT_VERSION := " cnt
-                  print "KSU_GIT_TAG := " tag
-                  print "KSU_GIT_VERSION_VALID := 1"
-                  print ""
-                  injected=1
-                }
-                { print }
-              ' "$KB" > "$KB.ktmp" && mv "$KB.ktmp" "$KB"
-              echo "--- Kbuild version block AFTER bake (KSU_GIT_VERSION=$KSU_CNT -> KSU_VERSION=$(expr 30000 + $KSU_CNT), tag=$KSU_TAG) ---"
-              grep -nE 'Kurumi|KSU_GIT_VERSION|KSU_GIT_TAG|KSU_GIT_VERSION_VALID' "$KB" || true
-            else
-              echo "WARN: KernelSU-Next Kbuild not found or count too small (KB='$KB' KSU_CNT='$KSU_CNT') -> version NOT baked."
-            fi
-          }
-
-          ( cd common && rm -rf KernelSU-Next \
-              && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
-              && ( cd KernelSU-Next && (git checkout "$KSU_NEXT_REF" || git checkout -b "$KSU_NEXT_REF" "origin/$KSU_NEXT_REF") ) )
-          KSU_CNT="$(cd common/KernelSU-Next && git rev-list --count HEAD 2>/dev/null || echo 0)"
-          echo "KernelSU-Next '$KSU_NEXT_REF' commit count (drives KSU_VERSION): $KSU_CNT"
-          ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_NEXT_REF" )
-          ksu_rc=$?
-          if [ "$ksu_rc" = 0 ] && [ "${KSU_CNT:-0}" -lt 500 ]; then
-            echo "WARN: KSU-Next history too shallow ($KSU_CNT) -> driver would report v0.0.1. Skipping KSU variant."
-            ksu_rc=1
-          fi
-          if [ "$ksu_rc" = 0 ]; then
-            bake_ksu_version
-            echo ok > "$GITHUB_WORKSPACE/kimg/ksu_ok"
-            echo "KSU-only integration OK -> building variant 2."
-          else
-            echo "WARN: KernelSU-Next setup failed (ksu_rc=$ksu_rc) - KSU-only variant skipped."
-          fi
-          set +x
-          exit 0
-
-      - name: Build kernel (KernelSU variant, non-fatal)
-        working-directory: /mnt/src/kp/kernel_platform
-        env:
-          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
-        run: |
-          set +e
-          [ -f "$GITHUB_WORKSPACE/kimg/ksu_ok" ] || { echo 'KSU integration skipped - not building variant 2.'; exit 0; }
-          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
-          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
-            --jobs=2 --local_ram_resources=9830 \
-            --nokleaf_localversion \
-            --action_env=LOCALVERSION \
-            --action_env=KBUILD_BUILD_USER \
-            --action_env=KBUILD_BUILD_HOST \
-            --action_env=KBUILD_BUILD_TIMESTAMP
-          rc=$?
-          if [ $rc -ne 0 ]; then
-            echo "WARN: KSU variant build failed (rc=$rc) - KSU-only variant skipped."
-            rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0
-          fi
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
-          IMG=""
-          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
-          if [ -z "$IMG" ]; then echo 'WARN: KSU Image not found post-build - KSU-only variant skipped'; rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"; exit 0; fi
-          CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
-          if echo "$CFG" | grep -q '^CONFIG_KSU=y'; then
-            echo 'OK: CONFIG_KSU=y baked into KSU Image'
-            cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu"
-            echo "stashed KSU image: $IMG -> kimg/kurumi_ksu"
-          else
-            echo 'WARN: CONFIG_KSU=y not detected in KSU Image config - KSU-only variant skipped'
-            rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
-          fi
-
-      - name: Integrate KernelSU-Next + susfs (variant 3 prep, non-fatal)
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_ksu_susfs.sh"
-
-      - name: Build kernel (KernelSU + susfs variant, non-fatal)
-        working-directory: /mnt/src/kp/kernel_platform
-        env:
-          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
-        run: |
-          set +e
-          [ -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok" ] || { echo 'KSU+susfs integration skipped - not building variant 3.'; exit 0; }
-          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
-          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
-            --jobs=2 --local_ram_resources=9830 \
-            --nokleaf_localversion \
-            --action_env=LOCALVERSION \
-            --action_env=KBUILD_BUILD_USER \
-            --action_env=KBUILD_BUILD_HOST \
-            --action_env=KBUILD_BUILD_TIMESTAMP
-          rc=$?
-          if [ $rc -ne 0 ]; then
-            echo "WARN: KSU+susfs variant build failed (rc=$rc) - variant skipped."
-            rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"; exit 0
-          fi
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
-          IMG=""
-          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
-          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
-          if [ -z "$IMG" ]; then echo 'WARN: KSU+susfs Image not found post-build - variant skipped'; rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"; exit 0; fi
-          CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
-          echo "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
-          if echo "$CFG" | grep -q '^CONFIG_KSU=y' && echo "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y'; then
-            echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y baked into KSU+susfs Image'
-            cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
-            echo "stashed KSU+susfs image: $IMG -> kimg/kurumi_ksu_susfs"
-          else
-            echo 'WARN: CONFIG_KSU_SUSFS=y not detected in Image config - KSU+susfs variant skipped'
-            rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
-          fi
-
-      - name: Package Kurumi flashable zip (kernel only)
+      - name: Integrate KernelSU-Next + SuSFS only (fast, strict)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
           set -e
-          # TEST FIRST WITH RAM-BOOT: `fastboot boot boot.img` (from out-artifacts) loads the
-          # kernel into RAM WITHOUT writing any partition -- a bad kernel is undone by a simple
-          # reboot (hold Power ~10s), so it CANNOT brick /data. Only after the kernel is confirmed
-          # stable in RAM should you consider the Kurumi zip below (permanent). The zip replaces
-          # ONLY the kernel inside the device's own boot image, preserving the original ramdisk;
-          # vbmeta is NOT touched or signed (patch_vbmeta_flag=0).
-          AK="$GITHUB_WORKSPACE/anykernel"
-          KIMG="$GITHUB_WORKSPACE/kimg"
-          [ -f "$KIMG/kurumi_stock" ] || { echo 'ERROR: stashed stock kernel image missing; cannot build zip'; exit 1; }
-          IMGNAME="$(cat "$KIMG/imgname" 2>/dev/null || echo Image.gz)"
-          echo "stock image: $KIMG/kurumi_stock (flash name: $IMGNAME)"
-          [ -f "$AK/anykernel.sh" ] || { echo 'ERROR: anykernel/ framework missing from repo'; exit 1; }
-          # All three profile binaries must have been produced by the Rust step above.
-          for p in eco balance full; do
-            KB="$AK/files/kurumi_bin/kurumi_$p"
-            [ -f "$KB" ] || { echo "ERROR: profile binary kurumi_$p missing (Rust build step did not run?)"; exit 1; }
-            file "$KB" | grep -q 'ELF' || { echo "ERROR: kurumi_$p is not an ELF binary"; exit 1; }
-          done
-          # interactive-installer assets must be shipped too
-          [ -f "$AK/tools/keycheck" ]       || { echo 'ERROR: tools/keycheck missing'; exit 1; }
-          [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
-          [ -f "$AK/files/dtb/kurumi_gpu.dtb" ] || { echo 'ERROR: files/dtb/kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
-          [ -f "$AK/files/dtb/stock_gpu.dtb" ] || { echo 'ERROR: files/dtb/stock_gpu.dtb (stock GPU dtb for revert) missing'; exit 1; }
-          # Drop the freshly built kernels in, replacing any stale images.
-          # Ship variants under names AnyKernel will NOT auto-detect; the flash-time menu copies
-          # the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a bare
-          # Image/Image.gz here or AnyKernel would auto-flash it and bypass the choice.
-          mkdir -p "$AK/files/image"
-          rm -f "$AK"/Image "$AK"/Image.gz "$AK"/Image-dtb "$AK"/Image.gz-dtb \
-            "$AK"/files/image/kurumi_stock "$AK"/files/image/kurumi_ksu "$AK"/files/image/kurumi_ksu_susfs
-          cp -v "$KIMG/kurumi_stock" "$AK/files/image/kurumi_stock"
-          printf '%s\n' "$IMGNAME" > "$AK/files/image/kurumi_imgname"
-          _variants="stock"
-          if [ -f "$KIMG/ksu_ok" ] && [ -f "$KIMG/kurumi_ksu" ]; then
-            cp -v "$KIMG/kurumi_ksu" "$AK/files/image/kurumi_ksu"
-            _variants="$_variants + KSU"
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_ksu_susfs.sh"
+          if [ ! -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok" ]; then
+            echo 'ERROR: KSU+SuSFS integration did not produce ksu_susfs_ok.'
+            echo 'This fast workflow is strict, so it fails here instead of wasting time on other variants.'
+            exit 1
           fi
-          if [ -f "$KIMG/ksu_susfs_ok" ] && [ -f "$KIMG/kurumi_ksu_susfs" ]; then
-            cp -v "$KIMG/kurumi_ksu_susfs" "$AK/files/image/kurumi_ksu_susfs"
-            _variants="$_variants + KSU+susfs"
-          fi
-          echo "packaging variants: $_variants"
-          # make sure the flasher binaries stay executable inside the zip
-          chmod 0755 "$AK"/tools/* "$AK"/META-INF/com/google/android/update-binary || true
-          mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
-          ZIP="$GITHUB_WORKSPACE/out-artifacts/Kurumi_kernel_build${GITHUB_RUN_NUMBER}.zip"
-          ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
-          echo 'Kurumi zip contents:'; unzip -l "$ZIP"
+          echo "KSU+SuSFS ref: $(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" 2>/dev/null || echo unknown)"
+          echo "KSU+SuSFS version: $(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" 2>/dev/null || echo unknown)"
 
-      - name: Upload artifacts
+      - name: Build kernel (KSU + SuSFS only, fast)
+        working-directory: /mnt/src/kp/kernel_platform
+        env:
+          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
+        run: |
+          set -e
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
+            --jobs=2 --local_ram_resources=9830 \
+            --nokleaf_localversion \
+            --action_env=LOCALVERSION \
+            --action_env=KBUILD_BUILD_USER \
+            --action_env=KBUILD_BUILD_HOST \
+            --action_env=KBUILD_BUILD_TIMESTAMP
+
+      - name: Verify KSU + SuSFS in built Image
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          IMG=""
+          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
+          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
+          [ -n "$IMG" ] || { echo 'ERROR: KSU+SuSFS Image not found after build'; exit 1; }
+          echo "Image: $IMG"
+          CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
+          if [ -z "$CFG" ]; then
+            echo 'WARN: extract-ikconfig returned empty config; cannot assert CONFIG_KSU_SUSFS.'
+          else
+            printf '%s\n' "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_KSU=y' || { echo 'ERROR: CONFIG_KSU=y not found in Image'; exit 1; }
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y' || { echo 'ERROR: CONFIG_KSU_SUSFS=y not found in Image'; exit 1; }
+            echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y are baked into the fast Image.'
+          fi
+          SMAP="$DIST/System.map"
+          if [ -f "$SMAP" ]; then
+            grep -E ' susfs_(init|show_version|get_enabled_features|show_variant)$| ksu_handle_sys_reboot$' "$SMAP" || true
+            grep -q ' susfs_show_version$' "$SMAP" || { echo 'ERROR: susfs_show_version symbol not found in System.map'; exit 1; }
+            grep -q ' ksu_handle_sys_reboot$' "$SMAP" || { echo 'ERROR: ksu_handle_sys_reboot symbol not found in System.map'; exit 1; }
+            echo 'OK: SuSFS runtime/query symbols are present in System.map.'
+          else
+            echo 'WARN: System.map not found; skipping SuSFS symbol assertion.'
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/kimg"
+          cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
+          basename "$IMG" > "$GITHUB_WORKSPACE/kimg/imgname"
+
+      - name: Collect fast SuSFS artifacts
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          OUT="$GITHUB_WORKSPACE/out-artifacts"
+          mkdir -p "$OUT"
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          echo "dist: $DIST"
+          for f in boot.img vendor_boot.img dtbo.img Image Image.gz kernel.release System.map Module.symvers; do
+            [ -f "$DIST/$f" ] && cp -v "$DIST/$f" "$OUT/" || true
+          done
+          [ -f "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs" ] && cp -v "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs" "$OUT/kurumi_ksu_susfs_$(cat "$GITHUB_WORKSPACE/kimg/imgname" 2>/dev/null || echo Image)"
+          [ -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" ] && cp -v "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" "$OUT/" || true
+          [ -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" ] && cp -v "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" "$OUT/" || true
+          ls -lah "$OUT"
+
+      - name: Upload fast SuSFS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tiro-kernel
+          name: tiro-kernel-susfs-fast
           path: out-artifacts/**
-          if-no-files-found: warn
-          retention-days: 14
+          if-no-files-found: error
+          retention-days: 7
