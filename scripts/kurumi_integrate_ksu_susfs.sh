@@ -148,6 +148,27 @@ def fix_namespace(s):
 
 rw(root/'fs/namespace.c', fix_namespace)
 
+# Current susfs4ksu v2.2.0 uses current_uid() inside susfs_def.h.
+# Some translation units include susfs_def.h before linux/cred.h, which turns
+# current_uid() into an implicit int and breaks -Werror builds. Patch the copied
+# header once after copying the SuSFS payload.
+def fix_susfs_def_header(s):
+    if 'current_uid().val' in s and '#include <linux/cred.h>' not in s:
+        if '#define' in s:
+            lines = s.split('\n')
+            out = []
+            inserted = False
+            for line in lines:
+                out.append(line)
+                if not inserted and line.startswith('#define'):
+                    out.append('#include <linux/cred.h>')
+                    inserted = True
+            return '\n'.join(out)
+        return '#include <linux/cred.h>\n' + s
+    return s
+
+rw(root/'include/linux/susfs_def.h', fix_susfs_def_header)
+
 # Some susfs4ksu history revisions rename hide-sus-mount APIs. Map only when the
 # target API is really present in the copied headers/source.
 sus_text = ''
@@ -173,6 +194,17 @@ def fix_c_file(s):
 
 for p in list((root/'drivers/kernelsu').rglob('*.c')) + list((root/'KernelSU-Next/kernel').rglob('*.c')) + list((root/'KernelSU/kernel').rglob('*.c')):
     rw(p, fix_c_file)
+
+# Do not include the full SuSFS public header from KernelSU selinux/rules.c.
+# It drags a heavy linux/sched/signal.h include path into the SELinux policy
+# translation unit and trips clang -Warray-bounds in common/include/linux/signal.h.
+# rules.c only needs susfs_set_batch_sid(), which we declare from KernelSU's
+# selinux.h in the compatibility bridge.
+for p in (root/'drivers/kernelsu/selinux/rules.c',
+          root/'KernelSU-Next/kernel/selinux/rules.c',
+          root/'KernelSU/kernel/selinux/rules.c'):
+    if p.exists():
+        rw(p, lambda s: s.replace('#include <linux/susfs.h>\n', ''))
 
 # If the current KernelSU-Next kept sucompat as a bool, adapt the common
 # susfs patch sites away from static_branch_* declarations.
