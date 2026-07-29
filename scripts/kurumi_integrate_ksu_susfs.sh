@@ -96,6 +96,14 @@ import re, sys
 root = Path('common')
 changed_any = False
 
+ksu_sucompat_bool = False
+for sp in (root/'KernelSU-Next/kernel/feature/sucompat.c', root/'KernelSU/kernel/feature/sucompat.c'):
+    if sp.exists():
+        st = sp.read_text(errors='ignore')
+        if 'bool ksu_su_compat_enabled' in st and 'DEFINE_STATIC_KEY_TRUE(ksu_su_compat_enabled)' not in st:
+            ksu_sucompat_bool = True
+
+
 def rw(path, fn):
     global changed_any
     p = Path(path)
@@ -166,6 +174,17 @@ def fix_c_file(s):
 for p in list((root/'drivers/kernelsu').rglob('*.c')) + list((root/'KernelSU-Next/kernel').rglob('*.c')) + list((root/'KernelSU/kernel').rglob('*.c')):
     rw(p, fix_c_file)
 
+# If the current KernelSU-Next kept sucompat as a bool, adapt the common
+# susfs patch sites away from static_branch_* declarations.
+if ksu_sucompat_bool:
+    for p in list((root/'fs').rglob('*.c')) + list((root/'kernel').rglob('*.c')):
+        def conv_sucompat_bool(s):
+            s = s.replace('extern struct static_key_true ksu_su_compat_enabled;', 'extern bool ksu_su_compat_enabled;')
+            s = s.replace('static_branch_likely(&ksu_su_compat_enabled)', 'likely(ksu_su_compat_enabled)')
+            s = s.replace('static_branch_unlikely(&ksu_su_compat_enabled)', 'unlikely(ksu_su_compat_enabled)')
+            return s
+        rw(p, conv_sucompat_bool)
+
 # Ensure KSU_SUSFS defaults to y for CI non-interactive defconfig.
 for kc in list((root/'drivers/kernelsu').rglob('Kconfig')) + list((root/'KernelSU-Next/kernel').glob('Kconfig')) + list((root/'KernelSU/kernel').glob('Kconfig')):
     txt = kc.read_text(errors='ignore')
@@ -191,7 +210,218 @@ for kc in list((root/'drivers/kernelsu').rglob('Kconfig')) + list((root/'KernelS
 print('KSU+susfs repair pass complete; changed=', changed_any)
 PY_REPAIR
 
-# 1) Install current KernelSU-Next first. For KSU+SuSFS, default to the latest
+cat > /tmp/kurumi_prepare_ksu_susfs_compat.py <<'PY_KSU_COMPAT'
+from pathlib import Path
+import sys
+
+root = Path('common')
+ksu = root / 'KernelSU-Next' / 'kernel'
+if not ksu.exists():
+    ksu = root / 'KernelSU' / 'kernel'
+if not ksu.exists():
+    print('KSU+susfs compat: KernelSU kernel dir not found')
+    sys.exit(1)
+
+changed = False
+
+def write_if_changed(path: Path, text: str):
+    global changed
+    old = path.read_text(errors='ignore') if path.exists() else ''
+    if old != text:
+        path.write_text(text)
+        changed = True
+        print('KSU+susfs compat:', path, 'updated')
+
+kconfig = ksu / 'Kconfig'
+if kconfig.exists():
+    txt = kconfig.read_text(errors='ignore')
+    if 'config KSU_SUSFS' not in txt:
+        block = '''
+
+menu "KernelSU - SUSFS"
+config KSU_SUSFS
+	bool "KernelSU addon - SUSFS"
+	depends on KSU
+	depends on THREAD_INFO_IN_TASK
+	default y
+	help
+	  Patch and Enable SUSFS to kernel with KernelSU.
+
+config KSU_SUSFS_SUS_PATH
+	bool "Enable to hide suspicious path"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_SUS_MOUNT
+	bool "Enable to hide suspicious mounts"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_SUS_KSTAT
+	bool "Enable to spoof suspicious kstat"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_SPOOF_UNAME
+	bool "Enable to spoof uname"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_ENABLE_LOG
+	bool "Enable logging susfs log to kernel"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+	bool "Enable to automatically hide ksu and susfs symbols from /proc/kallsyms"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+	bool "Enable to spoof /proc/bootconfig (gki) or /proc/cmdline (non-gki)"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_OPEN_REDIRECT
+	bool "Enable to redirect a path to be opened with another path"
+	depends on KSU_SUSFS
+	default y
+
+config KSU_SUSFS_SUS_MAP
+	bool "Enable to hide some mmapped real file from different proc maps interfaces"
+	depends on KSU_SUSFS
+	default y
+
+endmenu
+'''
+        pos = txt.rfind('\nendmenu')
+        if pos >= 0:
+            txt = txt[:pos] + block + txt[pos:]
+        else:
+            txt += block
+        write_if_changed(kconfig, txt)
+
+mk = ksu / 'Makefile'
+if mk.exists():
+    txt = mk.read_text(errors='ignore')
+    if 'SUSFS_VERSION' not in txt:
+        add = '''
+
+## For susfs stuff ##
+ifeq ($(shell test -e $(srctree)/fs/susfs.c; echo $$?),0)
+$(eval SUSFS_VERSION=$(shell cat $(srctree)/include/linux/susfs.h | grep -E '^#define SUSFS_VERSION' | cut -d' ' -f3 | sed 's/"//g'))
+$(info )
+$(info -- SUSFS_VERSION: $(SUSFS_VERSION))
+else
+$(info -- You have not integrated susfs in your kernel yet.)
+$(info -- Read: https://gitlab.com/simonpunk/susfs4ksu)
+endif
+'''
+        txt = txt.replace('\n# Keep a new line here!!', add + '\n# Keep a new line here!!')
+        write_if_changed(mk, txt)
+
+kb = ksu / 'Kbuild'
+if kb.exists():
+    txt = kb.read_text(errors='ignore')
+    if 'kurumi_susfs_compat.o' not in txt:
+        txt = txt.replace('kernelsu-objs := core/init.o\n', 'kernelsu-objs := core/init.o\n\nkernelsu-objs += kurumi_susfs_compat.o\n', 1)
+        write_if_changed(kb, txt)
+
+compat = ksu / 'kurumi_susfs_compat.c'
+compat_src = '''#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/printk.h>
+#include <linux/static_key.h>
+#include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/binfmts.h>
+
+struct user_arg_ptr;
+extern void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv);
+
+/*
+ * Compatibility bridge for current KernelSU-Next + susfs4ksu android14-6.1.
+ * susfs4ksu's common kernel patch calls these inline-hook entry points.
+ * Current KernelSU-Next still keeps its normal kprobes/syscall-hook runtime,
+ * so these wrappers are intentionally conservative and non-destructive.
+ */
+DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled);
+DEFINE_STATIC_KEY_TRUE(ksu_is_init_rc_hook_enabled);
+
+int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+\t\t\tvoid *argv, void *envp, int *flags)
+{
+\tif (filename_ptr && *filename_ptr && (*filename_ptr)->name)
+\t\tksu_handle_execveat_ksud((*filename_ptr)->name, (struct user_arg_ptr *)argv);
+\treturn 0;
+}
+
+int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+\t\t\tvoid *argv, void *envp, int *flags)
+{
+\treturn 0;
+}
+
+int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+\t\t\tint *mode, int *flags)
+{
+\treturn 0;
+}
+
+int ksu_handle_stat(int *dfd, struct filename **filename, int *flags)
+{
+\treturn 0;
+}
+
+void ksu_handle_sys_read(unsigned int fd)
+{
+}
+
+void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
+{
+}
+'''
+write_if_changed(compat, compat_src)
+
+init = ksu / 'core' / 'init.c'
+if init.exists():
+    txt = init.read_text(errors='ignore')
+    if '#include <linux/susfs.h>' not in txt:
+        txt = txt.replace('#include <linux/workqueue.h>\n', '#include <linux/workqueue.h>\n#include <linux/susfs.h>\n', 1)
+    if 'susfs_init();' not in txt:
+        anchor = 'ksu_syscall_hook_init();\n'
+        ins = 'ksu_syscall_hook_init();\n\n#ifdef CONFIG_KSU_SUSFS\n\tsusfs_init();\n#endif\n'
+        if anchor in txt:
+            txt = txt.replace(anchor, ins, 1)
+        else:
+            txt = txt.replace('ksu_feature_init();\n', '#ifdef CONFIG_KSU_SUSFS\n\tsusfs_init();\n#endif\n\n\tksu_feature_init();\n', 1)
+    write_if_changed(init, txt)
+
+for rel in ['hook/setuid_hook.c', 'hook/setuid_hook.h', 'hook/syscall_event_bridge.c']:
+    path = ksu / rel
+    if not path.exists():
+        continue
+    txt = path.read_text(errors='ignore')
+    txt = txt.replace('int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)',
+                      'int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid, uid_t suid)')
+    txt = txt.replace('ksu_handle_setresuid(old_uid, current_uid().val);',
+                      'ksu_handle_setresuid(old_uid, current_uid().val, current_uid().val);')
+    write_if_changed(path, txt)
+
+for pat in ('*.rej', '*.orig'):
+    for f in ksu.parent.rglob(pat):
+        try:
+            f.unlink()
+            changed = True
+        except FileNotFoundError:
+            pass
+
+print('KSU+susfs compat: completed; changed=', changed)
+PY_KSU_COMPAT
+
+# 1) Install current KernelSU-Next first.
+# For KSU+SuSFS, default to the latest
 # tagged release (same cadence as Manager releases). Explicit branch/tag still
 # works by setting KSU_SUSFS_REF, e.g. next/stable/dev/vX.Y.Z.
 KSU_REQ="${KSU_SUSFS_REF:-latest}"
@@ -263,12 +493,19 @@ if [ "$ksu_patch_rc" != 0 ] || [ -n "$KSU_REJ" ]; then
   for r in $KSU_REJ; do echo "----- $KSU_REPO/$r -----"; sed -n '1,180p' "$KSU_REPO/$r"; done
   echo '================================================================='
   echo "WARN: KSU-side susfs patch did NOT apply cleanly to current KernelSU-Next ($KSU_TAG)."
-  echo "WARN: This is an upstream API drift; keeping it non-fatal and skipping KSU+susfs variant."
-  exit 0
+  echo "WARN: reverting partial KSU-side patch and continuing with Kurumi KSU/SuSFS compatibility bridge instead of skipping variant 3."
+  git -C "$KSU_REPO" reset --hard -q HEAD
+  git -C "$KSU_REPO" clean -ffd -q
+  python3 /tmp/kurumi_prepare_ksu_susfs_compat.py || {
+    echo "WARN: KSU+susfs compatibility preparation failed -> variant skipped."
+    exit 0
+  }
+else
+  echo "KSU+susfs: KSU-side patch applied cleanly."
 fi
 
 grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_REPO/kernel" common/drivers/kernelsu 2>/dev/null || {
-  echo "WARN: KSU_SUSFS Kconfig symbol not found after KSU-side patch - KSU+susfs variant skipped."
+  echo "WARN: KSU_SUSFS Kconfig symbol not found after KSU-side patch/compat - KSU+susfs variant skipped."
   exit 0
 }
 
