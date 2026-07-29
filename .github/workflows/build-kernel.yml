@@ -29,11 +29,16 @@ jobs:
       GKI_COMMON_REPO: https://android.googlesource.com/kernel/common
       GKI_COMMON_BRANCH: android14-6.1
       # --- root variants ---
-      # Keep plain KSU on the fast-moving next branch. For susfs, use a
-      # pre-integrated KernelSU-Next SuSFS ref; the susfs4ksu KSU-side patch targets
-      # KernelSU-style sources and rejects on current KernelSU-Next legacy.
+      # KSU-only tracks the fast-moving next branch. KSU+SuSFS no longer pins an
+      # old v3.1.x ref: it scans KernelSU-Next refs, picks the newest ref that
+      # already exposes CONFIG_KSU_SUSFS, and rejects refs older than the current
+      # manager minimum. This keeps the in-kernel driver version aligned with the
+      # auto-updating KernelSU-Next Manager whenever upstream provides a matching
+      # legacy-susfs ref.
       KSU_NEXT_REF: next
-      KSU_SUSFS_REF: v3.2.0-legacy-susfs-v2
+      KSU_SUSFS_REF: auto
+      KSU_SUSFS_MIN_VERSION: "33188"
+      KSU_SUSFS_ALLOW_OLD: "false"
       SUSFS_BRANCH: gki-android14-6.1
       # --- nubia overlay sources ---
       NUBIA_KERNEL_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650.git
@@ -1067,26 +1072,78 @@ jobs:
           PY_REPAIR_KSU
 
           # 1) Add KernelSU-Next with pre-integrated SuSFS glue.
+          # v9: auto-select the newest compatible KernelSU-Next ref instead of
+          # stopping at an old v3.1.x tag. The Manager app follows upstream
+          # releases; the kernel driver version is derived from git commit count
+          # (KSU_VERSION = 30000 + rev-list --count HEAD). Keep KSU+SuSFS at or
+          # above the current manager minimum whenever upstream provides a fresh
+          # legacy-susfs ref.
           (
             cd common && rm -rf KernelSU-Next \
             && git clone https://github.com/KernelSU-Next/KernelSU-Next.git \
             && (
               cd KernelSU-Next \
-              && git fetch --tags --force \
-              && SELECTED_REF="" \
-              && for ref in "$KSU_SUSFS_REF" v3.2.0-legacy-susfs-v2 v3.1.0-legacy-susfs legacy-susfs-v2 legacy-susfs; do \
+              && git fetch --all --tags --force \
+              && MIN_VER="${KSU_SUSFS_MIN_VERSION:-33188}" \
+              && ALLOW_OLD="${KSU_SUSFS_ALLOW_OLD:-false}" \
+              && REQ_REF="${KSU_SUSFS_REF:-auto}" \
+              && : > /tmp/kurumi_ksu_susfs_candidates \
+              && if [ -n "$REQ_REF" ] && [ "$REQ_REF" != auto ]; then echo "$REQ_REF" >> /tmp/kurumi_ksu_susfs_candidates; fi \
+              && git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin refs/tags \
+                   | sed 's#^origin/##' \
+                   | grep -Ei '(^|[-_/])legacy[-_]?susfs($|[-_])|susfs.*legacy|legacy.*susfs' \
+                   >> /tmp/kurumi_ksu_susfs_candidates || true \
+              && printf '%s\n' legacy-susfs-v2 legacy-susfs v3.2.0-legacy-susfs-v2 v3.1.0-legacy-susfs >> /tmp/kurumi_ksu_susfs_candidates \
+              && awk 'NF && !seen[$0]++' /tmp/kurumi_ksu_susfs_candidates > /tmp/kurumi_ksu_susfs_candidates.uniq \
+              && echo 'KSU+susfs: candidate KernelSU-Next refs:' \
+              && sed 's/^/  - /' /tmp/kurumi_ksu_susfs_candidates.uniq \
+              && BEST_REF="" BEST_VER=0 BEST_CNT=0 BEST_HAS_MIN="" \
+              && while IFS= read -r ref; do \
                    [ -n "$ref" ] || continue; \
-                   if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi; \
-                   if git rev-parse --verify --quiet "origin/$ref^{commit}" >/dev/null; then SELECTED_REF="$ref"; break; fi; \
-                 done \
-              && [ -n "$SELECTED_REF" ] \
-              && echo "$SELECTED_REF" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" \
-              && (git checkout "$SELECTED_REF" || git checkout "tags/$SELECTED_REF" || git checkout -b "$SELECTED_REF" "origin/$SELECTED_REF")
+                   git reset --hard -q HEAD >/dev/null 2>&1 || true; \
+                   git clean -ffd -q >/dev/null 2>&1 || true; \
+                   if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then \
+                     git checkout -q "$ref" || continue; \
+                   elif git rev-parse --verify --quiet "tags/$ref^{commit}" >/dev/null; then \
+                     git checkout -q "tags/$ref" || continue; \
+                   elif git rev-parse --verify --quiet "origin/$ref^{commit}" >/dev/null; then \
+                     git checkout -q -B "$ref" "origin/$ref" || continue; \
+                   else \
+                     echo "KSU+susfs: candidate ref not found: $ref"; continue; \
+                   fi; \
+                   if ! grep -Rqs 'config[[:space:]]\+KSU_SUSFS' kernel common drivers 2>/dev/null; then \
+                     echo "KSU+susfs: skip '$ref' -> no CONFIG_KSU_SUSFS"; continue; \
+                   fi; \
+                   cnt="$(git rev-list --count HEAD 2>/dev/null || echo 0)"; \
+                   ver="$((30000 + cnt))"; \
+                   echo "KSU+susfs: candidate '$ref' -> KSU_VERSION=$ver (commit_count=$cnt)"; \
+                   if [ "$ver" -ge "$MIN_VER" ]; then \
+                     if [ -z "$BEST_HAS_MIN" ] || [ "$ver" -gt "$BEST_VER" ]; then \
+                       BEST_REF="$ref"; BEST_VER="$ver"; BEST_CNT="$cnt"; BEST_HAS_MIN=1; \
+                     fi; \
+                   elif [ -z "$BEST_HAS_MIN" ] && [ "$ver" -gt "$BEST_VER" ]; then \
+                     BEST_REF="$ref"; BEST_VER="$ver"; BEST_CNT="$cnt"; \
+                   fi; \
+                 done < /tmp/kurumi_ksu_susfs_candidates.uniq \
+              && [ -n "$BEST_REF" ] \
+              && if [ -z "$BEST_HAS_MIN" ] && [ "$ALLOW_OLD" != true ]; then \
+                   echo "WARN: newest KSU+susfs ref '$BEST_REF' reports KSU_VERSION=$BEST_VER, below manager minimum $MIN_VER; set KSU_SUSFS_ALLOW_OLD=true to build it anyway."; \
+                   exit 25; \
+                 fi \
+              && (git checkout -q "$BEST_REF" || git checkout -q "tags/$BEST_REF" || git checkout -q -B "$BEST_REF" "origin/$BEST_REF") \
+              && echo "$BEST_REF" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" \
+              && echo "$BEST_VER" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" \
+              && echo "$BEST_CNT" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_commit_count" \
+              && echo "KSU+susfs: selected KernelSU-Next ref '$BEST_REF' -> KSU_VERSION=$BEST_VER"
             )
           )
           ksu_pre_rc=$?
           if [ "$ksu_pre_rc" != 0 ]; then
-            echo "WARN: no usable pre-integrated KernelSU-Next SuSFS ref found (requested '$KSU_SUSFS_REF') - KSU+susfs variant skipped."
+            if [ "$ksu_pre_rc" = 25 ]; then
+              echo "WARN: no up-to-date KernelSU-Next SuSFS ref meets KSU_SUSFS_MIN_VERSION=${KSU_SUSFS_MIN_VERSION:-33188}; KSU+susfs variant skipped to avoid Manager/UAPI mismatch."
+            else
+              echo "WARN: no usable pre-integrated KernelSU-Next SuSFS ref found (requested '$KSU_SUSFS_REF') - KSU+susfs variant skipped."
+            fi
             exit 0
           fi
           KSU_SUSFS_SELECTED_REF="$(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" 2>/dev/null)"
