@@ -953,6 +953,61 @@ jobs:
               if p.exists():
                   susfs_text += p.read_text(errors='ignore') + '\n'
 
+          # KernelSU-Next uses kprobe hook mode here. The SuSFS common patch still
+          # injects legacy non-GKI hook references into input/exec/read paths:
+          #   ksu_input_hook, ksu_execveat_hook, ksu_vfs_read_hook.
+          # In kprobes mode those bool symbols may not be emitted by KernelSU-Next,
+          # so vmlinux link fails even though the hook code is intentionally inactive.
+          # Provide weak compatibility definitions; real KernelSU definitions, if present
+          # in a future ref, override these weak ones. Also provide weak v2.0-era
+          # SuSFS mount counters when the selected common patch references them but
+          # the history revision did not define them.
+          need_compat = False
+          for rel in ('common/drivers/input/input.c', 'common/fs/exec.c', 'common/fs/read_write.c', 'common/fs/namespace.c'):
+              pp = Path(rel)
+              if pp.exists():
+                  tt = pp.read_text(errors='ignore')
+                  if any(x in tt for x in ('ksu_input_hook', 'ksu_execveat_hook', 'ksu_vfs_read_hook', 'susfs_ksu_mnt_group_ida', 'susfs_ksu_mounts')):
+                      need_compat = True
+                      break
+          if need_compat:
+              ksu_dir = Path('common/drivers/kernelsu')
+              ksu_dir.mkdir(parents=True, exist_ok=True)
+              compat = ksu_dir / 'kurumi_susfs_compat.c'
+              compat.write_text(
+                  '// SPDX-License-Identifier: GPL-2.0\n'
+                  '/*\n'
+                  ' * Kurumi compatibility glue for KernelSU-Next kprobes mode + SuSFS common patch.\n'
+                  ' *\n'
+                  ' * Some SuSFS common patch revisions inject legacy KernelSU non-GKI hook bools into\n'
+                  ' * input/exec/read paths, while KernelSU-Next reports and builds in kprobes mode.\n'
+                  ' * Weak false defaults keep those legacy paths inactive and let kprobes mode handle\n'
+                  ' * root hooks. If a future KernelSU ref provides strong symbols, they override these.\n'
+                  ' */\n'
+                  '#include <linux/atomic.h>\n'
+                  '#include <linux/cache.h>\n'
+                  '#include <linux/idr.h>\n'
+                  '#include <linux/types.h>\n'
+                  '\n'
+                  '#ifdef CONFIG_KSU\n'
+                  '__attribute__((weak)) bool ksu_input_hook __read_mostly = false;\n'
+                  '__attribute__((weak)) bool ksu_execveat_hook __read_mostly = false;\n'
+                  '__attribute__((weak)) bool ksu_vfs_read_hook __read_mostly = false;\n'
+                  '#endif\n'
+                  '\n'
+                  '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                  '__attribute__((weak)) struct ida susfs_ksu_mnt_group_ida = IDA_INIT(susfs_ksu_mnt_group_ida);\n'
+                  '__attribute__((weak)) atomic64_t susfs_ksu_mounts = ATOMIC64_INIT(0);\n'
+                  '#endif\n'
+              )
+              kbuilds = [ksu_dir / 'Kbuild', ksu_dir / 'Makefile']
+              kbuild = next((x for x in kbuilds if x.exists()), ksu_dir / 'Kbuild')
+              kb = kbuild.read_text(errors='ignore') if kbuild.exists() else ''
+              if 'kurumi_susfs_compat.o' not in kb:
+                  kb = kb.rstrip() + '\n\n# Kurumi: weak legacy-hook/SuSFS compatibility glue for KSU+susfs variant\nobj-$(CONFIG_KSU) += kurumi_susfs_compat.o\n'
+                  kbuild.write_text(kb)
+              print('KSU+susfs repair: added weak compat symbols in %s and %s' % (compat, kbuild))
+
           for sc in Path('common/drivers/kernelsu').rglob('supercalls.c'):
               s = sc.read_text(errors='ignore')
               if 'susfs_' not in s and 'CMD_SUSFS_' not in s:
