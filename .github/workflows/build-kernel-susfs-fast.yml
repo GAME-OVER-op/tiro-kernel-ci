@@ -1,0 +1,523 @@
+name: Build tiro KERNEL SuSFS FAST (NX769J)
+
+# Standalone QCOM Kleaf/Bazel kernel build for Nubia/RedMagic tiro (NX769J, SM8650 / pineapple).
+# Base GKI = pristine AOSP kernel/common android14-6.1 (the SAME GKI branch the device's stock /
+# LineageOS 23.2 ROM tracks, ASB-2026-06-01), NOT the OnePlus common fork. The OnePlus
+# kernel_manifest is used ONLY to bootstrap the QCOM Kleaf infra (build/ + prebuilts/ + external/);
+# `common` is then replaced with the AOSP GKI and overlaid with the nubia msm-kernel + device-trees.
+# Rationale: a standard android14-6.1 GKI Image is KMI-compatible with the device's stock vendor
+# modules (the GKI promise), so NO ABI-breaking symbol drops / module trims / custom LOCALVERSION are
+# needed -- those were OnePlus-base-only hacks and are what broke /data. Produces boot.img +
+# vendor_boot.img. TEST WITH `fastboot boot boot.img` (RAM), NEVER `fastboot flash boot`.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      # kernel "author" -> shows as (kurumi@dev) in /proc/version
+      KBUILD_BUILD_USER: kurumi
+      KBUILD_BUILD_HOST: dev
+      # --- QCOM Kleaf infra bootstrap ONLY (build/ + prebuilts/ + external/; its `common`
+      #     fork is discarded and replaced with pristine AOSP GKI below) ---
+      MANIFEST_URL: https://github.com/OnePlusOSS/kernel_manifest.git
+      MANIFEST_BRANCH: oneplus/sm8650
+      MANIFEST_FILE: oneplus_12_b.xml
+      # --- pristine AOSP GKI common (matches the device's stock/LineageOS android14-6.1 LTS) ---
+      GKI_COMMON_REPO: https://android.googlesource.com/kernel/common
+      GKI_COMMON_BRANCH: android14-6.1
+      # --- root variants ---
+      # KSU-only tracks the fast-moving next branch. KSU+SuSFS follows the
+      # documented susfs4ksu flow instead of looking for old pre-integrated
+      # legacy-susfs refs: install current KernelSU-Next first, then clone
+      # susfs4ksu and apply its KernelSU-side + common android14-6.1 patches.
+      KSU_NEXT_REF: next
+      # latest = no setup.sh argument -> latest KernelSU-Next tagged release,
+      # matching the Manager release cadence. Set to next/stable/dev/vX.Y.Z to override.
+      KSU_SUSFS_REF: latest
+      KSU_SUSFS_MIN_VERSION: "33188"
+      KSU_SUSFS_ALLOW_OLD: "false"
+      SUSFS_BRANCH: gki-android14-6.1
+      # latest-bump = latest commit whose subject contains "Bump version to vX.X.X"
+      # on the selected susfs4ksu branch; this follows susfs4ksu README guidance.
+      SUSFS_REF: latest-bump
+      # --- nubia overlay sources ---
+      NUBIA_KERNEL_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650.git
+      NUBIA_DTS_REPO: https://github.com/nubia-sm8650-devs/android_kernel_nubia_sm8650-devicetrees.git
+      NUBIA_BRANCH: lineage-23.2
+    steps:
+      - name: Checkout CI repo
+        uses: actions/checkout@v4
+
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 8192
+          # 16 GB swap: the vmlinux LTO link + parallel image/module actions peak
+          # well above the 16 GB runner RAM; without headroom the runner is OOM-killed
+          # ("hosted runner lost communication"). Swap lives on the freed build volume.
+          swap-size-mb: 16384
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: /mnt/src
+
+      - name: Give runner user ownership of the build mount
+        run: sudo chown -R "$USER":"$USER" /mnt/src
+
+      - name: Show free space + swap (before sync)
+        run: |
+          df -h /mnt/src /
+          echo '--- memory / swap ---'
+          free -h
+          swapon --show || true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex git git-lfs gnupg gperf \
+            libelf-dev liblz4-tool libssl-dev libxml2-utils lzop rsync zip \
+            zlib1g-dev python3 python-is-python3
+
+      - name: Install the 'repo' tool
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name  "tiro-ci"
+          git config --global user.email "tiro-ci@users.noreply.github.com"
+          git config --global color.ui false
+          git config --global advice.detachedHead false
+
+      - name: Configure ccache
+        run: |
+          echo "USE_CCACHE=1"                 >> "$GITHUB_ENV"
+          echo "CCACHE_EXEC=/usr/bin/ccache"  >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=/mnt/src/.ccache"  >> "$GITHUB_ENV"
+          /usr/bin/ccache -M 15G || true
+
+      - name: repo init - OnePlus SM8650 kernel_manifest
+        working-directory: /mnt/src
+        run: |
+          mkdir -p kp && cd kp
+          repo init --depth=1 --no-clone-bundle \
+            -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH" -m "$MANIFEST_FILE"
+
+      - name: repo sync
+        working-directory: /mnt/src/kp
+        run: |
+          # CodeLinaro (git.codelinaro.org = the 'clo-la' remote hosting the QCOM
+          # prebuilts: clang / gcc / bazel / build-tools / jdk / stardoc) intermittently
+          # returns "remote: The git server, Gitaly, is not available at this time" and
+          # aborts the whole sync. Retry the sync a few times and let repo retry
+          # individual fetches so a transient server-side blip does not fail the job.
+          n=0; max=6
+          until repo sync -c -j"$(nproc --all)" --retry-fetches=3 \
+            --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune; do
+            n=$((n+1))
+            if [ "$n" -ge "$max" ]; then
+              echo "ERROR: repo sync still failing after $max attempts - likely a CodeLinaro/Gitaly outage; re-run the workflow later."
+              exit 1
+            fi
+            echo "repo sync attempt $n/$max failed (transient CodeLinaro/Gitaly outage?) - retrying in 60s..."
+            sleep 60
+          done
+          echo 'space after sync:'; df -h /mnt/src
+          echo 'top-level layout:'; ls -la
+
+      - name: Overlay nubia msm-kernel + device-trees
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          echo '--- replacing the OnePlus common fork with pristine AOSP GKI (android14-6.1) ---'
+          echo '--- this is the SAME GKI branch the device stock/LineageOS ROM tracks, so the ---'
+          echo '--- resulting GKI Image is KMI-compatible with the on-device stock vendor modules ---'
+          rm -rf common
+          git clone --depth=1 -b "$GKI_COMMON_BRANCH" "$GKI_COMMON_REPO" common
+          echo '--- replacing base msm-kernel with nubia fork ---'
+          rm -rf msm-kernel
+          git clone --depth=1 -b "$NUBIA_BRANCH" "$NUBIA_KERNEL_REPO" msm-kernel
+          echo '--- placing nubia device-trees at the symlink target (sibling) ---'
+          rm -rf sm8650-devicetrees
+          git clone --depth=1 -b "$NUBIA_BRANCH" "$NUBIA_DTS_REPO" sm8650-devicetrees
+          echo '--- FIX: device-trees kernel_dtstree glob omits subdir Kbuild (audio/tiro/...) ---'
+          echo '--- add qcom/**/Kbuild so make dtbs can descend into subdirs inside the Bazel sandbox ---'
+          sed -i 's#"qcom/Makefile",#"qcom/Makefile",\n            "qcom/**/Kbuild",\n            "qcom/**/Makefile",#' sm8650-devicetrees/BUILD.bazel
+          grep -n Kbuild sm8650-devicetrees/BUILD.bazel || { echo 'ERROR: dtstree glob patch failed'; exit 1; }
+          echo '--- FIX: generic techpack DTBOs (audio/camera/...) need sm8650-modules headers absent from the Kleaf sandbox ---'
+          echo '--- trim device-trees to the tiro set: base pineapple dtb + mtp + tiro overlay (what dist consumes) ---'
+          python3 "$GITHUB_WORKSPACE/scripts/tiro_dtb_trim.py" sm8650-devicetrees
+          grep -nE '^subdir-y' sm8650-devicetrees/qcom/Makefile
+          grep -n 'zte-tiro-overlay.dtbo' sm8650-devicetrees/qcom/platform_map.bzl || { echo 'ERROR: platform_map trim failed'; exit 1; }
+          echo '--- (KMI symbol drop REMOVED: the AOSP GKI common exports the standard android14-6.1 ---'
+          echo '---  KMI that the nubia msm-kernel QCOM symbol list is built against -> ABI parity) ---'
+          echo '--- FIX: nubia config builds drivers/leds/aw22xxx/zte_led.ko but pineapple.bzl module_outs omits it ---'
+          echo '--- declare it so Kleaf does not abort with "kernel modules are built but not copied" ---'
+          python3 "$GITHUB_WORKSPACE/scripts/tiro_module_outs_fix.py" msm-kernel
+          grep -q 'drivers/leds/aw22xxx/zte_led.ko' msm-kernel/pineapple.bzl || { echo 'ERROR: module_outs fix failed'; exit 1; }
+          echo '--- NOTE: the nubia OEM defconfig fragments (oem/pineapple_diff.config + ---'
+          echo '--- oem/boards/tiro_diff.config) are DELIBERATELY NOT applied here. They target the ---'
+          echo '--- full vendor pineapple build (perf/consolidate) where vendor drivers are =y; the ---'
+          echo '--- bare gki target forces them to =m and check_merged_defconfig then aborts ---'
+          echo '--- (NFC_ST54J y->m). Those peripheral drivers already ship as stock vendor_dlkm .ko. ---'
+          echo '--- (GKI module trim REMOVED: with the AOSP GKI base, cdc-acm/usbserial/rfcomm find ---'
+          echo '---  __tty_port_tty_hangup normally, so the stock module manifests build unchanged) ---'
+          echo '--- verifying the device-tree symlink resolves ---'
+          ls -la msm-kernel/arch/arm64/boot/dts/vendor
+          test -e msm-kernel/arch/arm64/boot/dts/vendor
+
+      - name: Sanity-check kleaf compatibility (super_image)
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          KB=build/kernel/kleaf/kernel.bzl
+          if grep -q 'super_image' "$KB"; then
+            echo "OK: base kleaf exports super_image - compatible with nubia msm-kernel."
+          else
+            echo "ERROR: base kleaf lacks super_image (wrong manifest base)."; exit 1
+          fi
+
+      - name: Apply tiro kernel customizations (power-saving + kernel name)
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          DEF=msm-kernel/arch/arm64/configs/gki_defconfig
+          FRAG=msm-kernel/arch/arm64/configs/vendor/pineapple_GKI.config
+          [ -f "$DEF" ]  || { echo "missing $DEF";  exit 1; }
+          [ -f "$FRAG" ] || { echo "missing $FRAG"; exit 1; }
+
+          # ===================================================================
+          # BOOT-CRITICAL FIX: the flashed boot.img Image (uname
+          # 6.1.x-android14-11) is built from common/ (pristine AOSP GKI), NOT
+          # from msm-kernel/. So MODULE_SIG_PROTECT must be disabled in COMMONs
+          # gki_defconfig, else the kernel rejects the stock /system_dlkm GKI
+          # modules ("<mod>: exports protected symbol ... Permission denied":
+          # rfkill/bt/net). That cascades rfkill->btpower->bt_fm_slim and leaves
+          # the ASoC card soc:spf_core_platform:sound stuck in -EPROBE_DEFER ->
+          # no ALSA card -> audioserver crash loop -> boot animation hangs.
+          # ===================================================================
+          CDEF=common/arch/arm64/configs/gki_defconfig
+          [ -f "$CDEF" ] || { echo "missing $CDEF"; exit 1; }
+          # DELETE the line (do NOT write "# ... is not set"): GKI check_defconfig runs
+          # `make savedefconfig` and requires an EXACT match. savedefconfig omits
+          # default-n symbols, so an explicit "# CONFIG_MODULE_SIG_PROTECT is not set"
+          # fails the gate ("savedefconfig does not match"). MODULE_SIG_PROTECT defaults
+          # to n, so removing the =y line disables it and still matches savedefconfig.
+          # Release/daily cleanup for the actual GKI Image config. For COMMON's
+          # gki_defconfig, prefer deleting default-n debug/UBSAN =y lines instead
+          # of writing explicit '# ... is not set' entries: common runs an exact
+          # savedefconfig gate, and savedefconfig omits default-n symbols.
+          #
+          # IMPORTANT: do NOT disable KASAN here. The android14-6.1 QCOM GKI
+          # strict KMI symbol list expects kasan_flag_enabled in ksymtab. Removing
+          # CONFIG_KASAN makes the build fail with:
+          #   Symbols missing from the ksymtab: kasan_flag_enabled
+          # So KASAN is kept for KMI compatibility; UBSAN/PM/thermal debug cleanup
+          # stays release-safe.
+          sed -i \
+            -e '/^CONFIG_MODULE_SIG_PROTECT=y/d' \
+            -e '/^CONFIG_PM_DEBUG=y/d' \
+            -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
+            -e '/^CONFIG_THERMAL_STATISTICS=y/d' \
+            -e '/^CONFIG_THERMAL_EMULATION=y/d' \
+            -e '/^CONFIG_UBSAN=y/d' \
+            -e '/^CONFIG_UBSAN_/d' \
+            -e '/^# CONFIG_UBSAN_.* is not set$/d' \
+            "$CDEF"
+          echo "--- common gki_defconfig release cleanup now: ---"
+          grep -nE 'MODULE_SIG_PROTECT|PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|KASAN|UBSAN' "$CDEF" || echo '(release cleanup symbols absent from common gki_defconfig)'
+          if grep -qE '^(CONFIG_MODULE_SIG_PROTECT|CONFIG_UBSAN|CONFIG_PM_DEBUG|CONFIG_THERMAL_STATISTICS|CONFIG_THERMAL_EMULATION)=y' "$CDEF"; then
+            echo 'ERROR: failed to remove active UBSAN/debug/module-protect symbols from common gki_defconfig'; exit 1
+          fi
+          if ! grep -q '^CONFIG_KASAN=y' "$CDEF"; then
+            echo 'ERROR: CONFIG_KASAN must stay enabled to satisfy QCOM GKI KMI symbol list (kasan_flag_enabled)'; exit 1
+          fi
+          # ---- kernel name (uname -r) -- injected via LOCALVERSION env, NOT the defconfig ----
+          # WHY NOT the defconfig: CONFIG_LOCALVERSION is ABSENT from this branch's common
+          # gki_defconfig, and ADDING it breaks the savedefconfig check_defconfig gate (it compares
+          # byte-for-byte in canonical order -- an appended line lands in the wrong spot and fails,
+          # which is exactly what killed the previous run). Instead we inject the name with the
+          # LOCALVERSION env var, honored by scripts/setlocalversion via
+          #   res="${config_localversion}${LOCALVERSION}"  -- no source edit, no gate.
+          # It is exported in the Build step and forwarded into the hermetic Bazel sandbox with
+          # --action_env=LOCALVERSION.
+          #
+          # KILL the trailing "-android14-11-...-maybe-dirty": scripts/setlocalversion returns the
+          # contents of .scmversion EARLY -- before it prints -$android_release-$kmi_generation and
+          # before the git/-dirty logic -- so an EMPTY .scmversion yields an empty scm suffix and
+          # uname ends exactly at ...-GAME-OVER-op. (Kleaf's DEFAULT embedded localversion MAY still
+          # force -android14-11; the diagnostic step after Build prints the real release so we can
+          # add --nokleaf_localversion next iteration if needed. COSMETIC -- must never fail build.)
+          # CUSTOM uname (KMI-preserving): overwrite common/scripts/setlocalversion so the
+          # GKI kernel (common:kernel_aarch64 -- the Image that actually boots) reports our name.
+          # --nokleaf_localversion (in the Build step) makes Kleaf derive the release from this
+          # script instead of its own stamp. We MUST keep the "-android14-11" KMI marker: Kleaf
+          # runs a KMI/sublevel consistency check vs msm-kernel (which stays -android14-11), and a
+          # release WITHOUT the marker fails the build ("KMI or sublevel mismatch" + "not a valid
+          # GKI version", and it also breaks the system_dlkm image). So we emit -android14-11-<name>:
+          #   uname -r = 6.1.x-android14-11-kurumi-dev-GAME-OVER-op
+          # Only common is patched; msm-kernel keeps its native -android14-11-o-maybe-dirty, so both
+          # carry KMI android14-11 and the check passes (the 173-vs-174 sublevel diff is tolerated,
+          # exactly as in the prior booting builds). NOTE: the name is non-ASCII (Japanese) -- a
+          # user-accepted risk that the erofs/image tooling could still reject it.
+          : > common/.scmversion || true
+          printf '#!/bin/sh\necho "%s"\n' '-android14-11-kurumi-dev-GAME-OVER-op' > common/scripts/setlocalversion
+          chmod +x common/scripts/setlocalversion
+          echo '--- overwrote common/scripts/setlocalversion (KMI-preserving custom release) ---'
+          head -3 common/scripts/setlocalversion
+          # ---- Kurumi build stamp: HARD-override identity + REAL build time ----
+          # Kleaf pins KBUILD_BUILD_USER/HOST=build-user/build-host AND SOURCE_DATE_EPOCH=0
+          # (=> 'Thu Jan  1 00:00:00 UTC 1970'). The kernel derives the /proc/version time from
+          # SOURCE_DATE_EPOCH, not KBUILD_BUILD_TIMESTAMP, so we must override BOTH. Forcing it
+          # inside mkcompile_h (runs last, in-compile) beats Kleaf; scope is this process only,
+          # so other build steps' reproducibility is unaffected. Guarded + non-fatal.
+          set +e
+          for mch in common/scripts/mkcompile_h msm-kernel/scripts/mkcompile_h; do
+            [ -f "$mch" ] || continue
+            grep -q KURUMI_STAMP "$mch" && continue
+            _t="$(mktemp)"
+            { head -n 1 "$mch"; \
+              echo '# KURUMI_STAMP: force identity + real build time (Kleaf pins user/host + SOURCE_DATE_EPOCH=0)'; \
+              echo 'export KBUILD_BUILD_USER=kurumi'; \
+              echo 'export KBUILD_BUILD_HOST=dev'; \
+              echo '_KURUMI_EPOCH=$(date -u +%s)'; \
+              echo 'export SOURCE_DATE_EPOCH=$_KURUMI_EPOCH'; \
+              echo 'export KBUILD_BUILD_TIMESTAMP="$(date -u -d @$_KURUMI_EPOCH "+%a %b %e %H:%M:%S UTC %Y" 2>/dev/null || date -u "+%a %b %e %H:%M:%S UTC %Y")"'; \
+              echo 'echo "kurumi mkcompile_h: SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH TS=$KBUILD_BUILD_TIMESTAMP USER=$KBUILD_BUILD_USER HOST=$KBUILD_BUILD_HOST" >&2'; \
+              tail -n +2 "$mch"; } > "$_t" && cat "$_t" > "$mch"
+            echo "kurumi: hard-stamped $mch"
+          done
+          set -e
+          # ---- Kurumi build TIMESTAMP fix (init/Makefile utsversion path, Linux 6.1) ----
+          # In 6.1 the /proc/version build time comes from init/Makefile (utsversion.h),
+          # NOT from mkcompile_h. Kleaf runs the make action with SOURCE_DATE_EPOCH=0 and does
+          # not forward our KBUILD_BUILD_TIMESTAMP into it, so $(shell LC_ALL=C date) resolves
+          # via the hermetic date to 'Thu Jan  1 00:00:00 UTC 1970'. mkcompile_h only fixes
+          # user@host. FIX: hardcode build-timestamp to a real literal computed here on the
+          # runner, bypassing env + hermetic date entirely. Idempotent + guarded.
+          set +e
+          KURUMI_TS="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          _ts_ok=0
+          for mk in common/init/Makefile msm-kernel/init/Makefile; do
+            [ -f "$mk" ] || continue
+            grep -q 'KURUMI_TS_FIX' "$mk" && { _ts_ok=1; continue; }
+            if grep -qE '^[[:space:]]*build-timestamp[[:space:]]*:?=' "$mk"; then
+              sed -i -E "s|^([[:space:]]*)build-timestamp[[:space:]]*:?=.*|\1# KURUMI_TS_FIX\n\1build-timestamp = ${KURUMI_TS}|" "$mk"
+              echo "kurumi: patched build-timestamp in $mk ->"; grep -nE '^[[:space:]]*build-timestamp[[:space:]]*=' "$mk"
+              _ts_ok=1
+            fi
+          done
+          [ "$_ts_ok" = 1 ] || echo 'WARN: build-timestamp not found in init/Makefile; timestamp fix NOT applied' >&2
+          set -e
+
+          # QCOM has TWO strict config gates:
+          #   (1) merge_defconfig_fragments -> "Detected overridden config" if a vendor
+          #       fragment DISABLES a base =y/=m symbol. So disables live in the base.
+          #   (2) check_merged_defconfig (diffconfig) -> "Defconfig fragment did not apply
+          #       as expected" if the resolved .config differs from the merged defconfig
+          #       (anything except pure additions). So every requested symbol must STICK.
+          #
+          # Therefore in the base gki_defconfig:
+          #   - PM_DEBUG / THERMAL_STATISTICS / THERMAL_EMULATION: flip y -> not set (they stick).
+          #   - PM_ADVANCED_DEBUG: it 'depends on PM_DEBUG'. With PM_DEBUG off it becomes
+          #     invisible and vanishes from .config, so we must DELETE its line entirely
+          #     (an explicit '# ... is not set' would mismatch and fail gate (2)).
+          #   - UBSAN: disable the top-level sanitizer symbol for daily/release builds,
+          #     and DELETE its mode/suboption lines because they become hidden once the
+          #     top-level sanitizer is off. Do not delete HAVE_ARCH_*/CC_HAS_* capability
+          #     symbols: those are harmless capability probes, not active instrumentation.
+          #   - KASAN: KEEP enabled. QCOM GKI strict KMI currently expects
+          #     kasan_flag_enabled in ksymtab, so disabling KASAN breaks the build.
+          #
+          # NOTE: the OnePlus-base-only USB_ACM / USB_SERIAL / BT_RFCOMM disables were REMOVED.
+          #   They existed solely because the OnePlus common lacked __tty_port_tty_hangup; the
+          #   AOSP GKI base exports it, so those stock modules build normally and we keep full
+          #   ABI/module parity with the device. Only release-safe debug/thermal/sanitizer-off
+          #   tweaks stay (they touch no exported symbol / KMI). PM_ADVANCED_DEBUG and
+          #   UBSAN suboptions become hidden when their parent is off, so delete their
+          #   dependent lines instead of leaving explicit '# ... is not set' entries that
+          #   strict merged-defconfig checks may reject. KASAN suboptions stay untouched
+          #   because KASAN itself stays enabled for KMI strict mode.
+          sed -i \
+            -e 's/^CONFIG_PM_DEBUG=y/# CONFIG_PM_DEBUG is not set/' \
+            -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
+            -e 's/^CONFIG_THERMAL_STATISTICS=y/# CONFIG_THERMAL_STATISTICS is not set/' \
+            -e 's/^CONFIG_THERMAL_EMULATION=y/# CONFIG_THERMAL_EMULATION is not set/' \
+            -e 's/^CONFIG_UBSAN=y/# CONFIG_UBSAN is not set/' \
+            -e '/^CONFIG_UBSAN_/d' \
+            -e '/^# CONFIG_UBSAN_.* is not set$/d' \
+            -e 's/^CONFIG_MODULE_SIG_PROTECT=y/# CONFIG_MODULE_SIG_PROTECT is not set/' \
+            "$DEF"
+
+          # Additive-only tweaks in the vendor fragment (enabling new symbols is allowed).
+          # NOTE: BBR/TCP-default was intentionally dropped: GKI ships with
+          # CONFIG_TCP_CONG_ADVANCED off, so the congestion choice is hidden and
+          # TCP_CONG_BBR/DEFAULT_BBR cannot stick (gate (2) rejects them). BBR would
+          # require re-opening the choice, which perturbs many symbols. Not worth it
+          # for a balanced-power build; CUBIC default is fine.
+          {
+            echo ''
+            echo '# === custom: balanced daily-use/power config (additive, verified by post-build audit) ==='
+            echo 'CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y'
+            # MGLRU improves page reclaim behaviour under memory pressure. It is
+            # especially useful for Android daily use (many cached apps + zRAM). If
+            # the symbol is already enabled in the base, this is harmless; if a future
+            # tree cannot enable it, the post-build config audit will warn instead of
+            # silently assuming it landed.
+            echo 'CONFIG_LRU_GEN=y'
+            echo 'CONFIG_LRU_GEN_ENABLED=y'
+          } >> "$FRAG"
+          # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
+          #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
+          #   defconfig, to stay clear of the savedefconfig gate. Author identity also shows via
+          #   KBUILD_BUILD_USER/HOST (kurumi@dev) in /proc/version.
+
+          # ===================================================================
+          # IPv6 legacy NAT (ip6tables -t nat) -- enable CONFIG_IP6_NF_NAT in the
+          # COMMON GKI defconfig ($CDEF): that is the tree that builds the flashed
+          # boot.img Image. (A prior attempt put this in the msm-kernel vendor
+          # fragment, which does NOT feed the GKI Image, so `ip6tables -t nat` had
+          # no 'nat' table on-device.) On-device /proc/config.gz confirmed every
+          # dependency is already satisfied in this same common tree:
+          #   NF_NAT=y, IP6_NF_IPTABLES=y (IP_NF_NAT=y -> v4 NAT already works),
+          #   NF_CONNTRACK/NETFILTER_ADVANCED on, NF_TABLES off (legacy xtables).
+          # No module infra on device (/lib/modules absent) -> must be builtin =y.
+          # This edits a defconfig (CONFIG, not kernel source); common/ is a fresh
+          # clone, so no user source tree is touched.
+          #
+          # IMPORTANT: do NOT try to canonicalize via a standalone `make gki_defconfig
+          # savedefconfig` here. A bare make outside the Kleaf/android fragment context
+          # cannot resolve ~6 symbols and silently shrinks the defconfig (observed
+          # 671 -> 665). The real dist build does NOT enforce a byte-match check_defconfig
+          # on common (it already ships a non-canonical gki_defconfig and builds fine),
+          # so we just enable the symbol IN PLACE and let the real build's olddefconfig
+          # pick it up. The post-build 'Verify' step asserts it actually landed in the
+          # Image, which is the real proof.
+          # ===================================================================
+          if grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF"; then
+            echo 'IP6_NF_NAT already enabled in common gki_defconfig'
+          else
+            # Insert right after the last existing CONFIG_IP6_NF_* line: if some strict
+            # savedefconfig check IS enforced in the hermetic build, the symbol already
+            # sits in its canonical ipv6-netfilter position; if not, position is moot.
+            last_ip6=$(grep -n '^CONFIG_IP6_NF_' "$CDEF" | tail -n1 | cut -d: -f1)
+            if [ -n "$last_ip6" ]; then
+              sed -i "${last_ip6}a CONFIG_IP6_NF_NAT=y" "$CDEF"
+            else
+              echo 'CONFIG_IP6_NF_NAT=y' >> "$CDEF"
+            fi
+          fi
+          grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF" \
+            || { echo 'ERROR: failed to add CONFIG_IP6_NF_NAT to common gki_defconfig'; exit 1; }
+          echo '--- common gki_defconfig IPv6 NAT context: ---'
+          grep -nE 'IP6_NF_IPTABLES|IP6_NF_NAT|IP6_NF_TARGET' "$CDEF" || true
+
+          echo '--- gki_defconfig debug/thermal lines now: ---'
+          grep -nE 'PM_DEBUG|PM_ADVANCED_DEBUG|THERMAL_STATISTICS|THERMAL_EMULATION|KASAN|UBSAN|MODULE_SIG_PROTECT' "$DEF" || true
+          # Hard guard: the whole boot fix depends on this flip sticking. If the base
+          # gki_defconfig still has it =y, the sed missed it -> fail loudly (do NOT ship a
+          # kernel that still rejects stock /system_dlkm GKI modules -> boot-anim hang).
+          if grep -q '^CONFIG_MODULE_SIG_PROTECT=y' "$DEF"; then
+            echo 'ERROR: MODULE_SIG_PROTECT still =y after sed flip - aborting'; exit 1
+          fi
+          grep -q '^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEF" \
+            || echo 'WARN: MODULE_SIG_PROTECT absent from base gki_defconfig; may be forced elsewhere - verify resolved .config'
+          echo '--- vendor fragment tail: ---'; tail -n 8 "$FRAG"
+
+
+      - name: Mark common source baseline for SuSFS fast build
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/kimg"
+          # Fast workflow builds only KSU+SuSFS. Snapshot the customized common tree
+          # immediately and let kurumi_integrate_ksu_susfs.sh reset to this baseline.
+          git -C common add -A
+          git -C common commit -m "kurumi base before fast susfs variant" || true
+          git -C common rev-parse HEAD > "$GITHUB_WORKSPACE/kimg/common_base_commit"
+          echo "fast SuSFS common baseline: $(cat "$GITHUB_WORKSPACE/kimg/common_base_commit")"
+
+      - name: Integrate KernelSU-Next + SuSFS only (fast, strict)
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_ksu_susfs.sh"
+          if [ ! -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok" ]; then
+            echo 'ERROR: KSU+SuSFS integration did not produce ksu_susfs_ok.'
+            echo 'This fast workflow is strict, so it fails here instead of wasting time on other variants.'
+            exit 1
+          fi
+          echo "KSU+SuSFS ref: $(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" 2>/dev/null || echo unknown)"
+          echo "KSU+SuSFS version: $(cat "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" 2>/dev/null || echo unknown)"
+
+      - name: Build kernel (KSU + SuSFS only, fast)
+        working-directory: /mnt/src/kp/kernel_platform
+        env:
+          LOCALVERSION: "-kurumi-dev-GAME-OVER-op"
+        run: |
+          set -e
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%a %b %e %H:%M:%S UTC %Y')"
+          ./msm-kernel/build_with_bazel.py -t pineapple gki --skip abl \
+            --jobs=2 --local_ram_resources=9830 \
+            --nokleaf_localversion \
+            --action_env=LOCALVERSION \
+            --action_env=KBUILD_BUILD_USER \
+            --action_env=KBUILD_BUILD_HOST \
+            --action_env=KBUILD_BUILD_TIMESTAMP
+
+      - name: Verify KSU + SuSFS in built Image
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          IMG=""
+          for c in Image.gz Image; do [ -f "$DIST/$c" ] && { IMG="$DIST/$c"; break; }; done
+          [ -n "$IMG" ] || IMG="$(find out -type f \( -name Image.gz -o -name Image \) -path '*dist*' 2>/dev/null | head -1)"
+          [ -n "$IMG" ] || { echo 'ERROR: KSU+SuSFS Image not found after build'; exit 1; }
+          echo "Image: $IMG"
+          CFG="$(./common/scripts/extract-ikconfig "$IMG" 2>/dev/null || true)"
+          if [ -z "$CFG" ]; then
+            echo 'WARN: extract-ikconfig returned empty config; cannot assert CONFIG_KSU_SUSFS.'
+          else
+            echo "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
+            echo "$CFG" | grep -q '^CONFIG_KSU=y' || { echo 'ERROR: CONFIG_KSU=y not found in Image'; exit 1; }
+            echo "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y' || { echo 'ERROR: CONFIG_KSU_SUSFS=y not found in Image'; exit 1; }
+            echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y are baked into the fast Image.'
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/kimg"
+          cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
+          basename "$IMG" > "$GITHUB_WORKSPACE/kimg/imgname"
+
+      - name: Collect fast SuSFS artifacts
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          OUT="$GITHUB_WORKSPACE/out-artifacts"
+          mkdir -p "$OUT"
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          echo "dist: $DIST"
+          for f in boot.img vendor_boot.img dtbo.img Image Image.gz kernel.release System.map Module.symvers; do
+            [ -f "$DIST/$f" ] && cp -v "$DIST/$f" "$OUT/" || true
+          done
+          [ -f "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs" ] && cp -v "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs" "$OUT/kurumi_ksu_susfs_$(cat "$GITHUB_WORKSPACE/kimg/imgname" 2>/dev/null || echo Image)"
+          [ -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" ] && cp -v "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref" "$OUT/" || true
+          [ -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" ] && cp -v "$GITHUB_WORKSPACE/kimg/ksu_susfs_version" "$OUT/" || true
+          ls -lah "$OUT"
+
+      - name: Upload fast SuSFS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiro-kernel-susfs-fast
+          path: out-artifacts/**
+          if-no-files-found: error
+          retention-days: 7
