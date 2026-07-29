@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# Integrate current KernelSU-Next plus SuSFS according to susfs4ksu docs:
+#   1) install KernelSU-Next release/tag/branch with setup.sh
+#   2) clone susfs4ksu separately
+#   3) apply kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch to KernelSU-Next
+#   4) copy fs/include payload and apply 50_add_susfs_* common patch
+# The step is intentionally non-fatal for the whole workflow: it either writes
+# kimg/ksu_susfs_ok or exits 0 and lets packaging omit variant 3.
+
+set +e
+set -x
+
+rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
+BASE="$(cat "$GITHUB_WORKSPACE/kimg/common_base_commit" 2>/dev/null)"
+[ -n "$BASE" ] || { echo "WARN: common baseline missing - skipping KSU+susfs variant"; exit 0; }
+
+git -C common reset --hard "$BASE"
+git -C common clean -ffd
+
+bake_ksu_version() {
+  KB="$(find . -path '*KernelSU-Next/kernel/Kbuild' -o -path '*KernelSU/kernel/Kbuild' 2>/dev/null | head -1)"
+  KSU_REPO="$(dirname "$(dirname "$KB")")"
+  KSU_TAG="$(cd "$KSU_REPO" 2>/dev/null && git describe --tags --abbrev=0 2>/dev/null || echo v1.0.0)"
+  if [ -n "$KB" ] && [ "${KSU_CNT:-0}" -ge 500 ]; then
+    awk -v cnt="$KSU_CNT" -v tag="$KSU_TAG" '
+      /^# Check if this is a git repository/ && !injected {
+        print "# --- Kurumi: hardcoded version for hermetic Kleaf build (no .git/network) ---"
+        print "KSU_GIT_VERSION := " cnt
+        print "KSU_GIT_TAG := " tag
+        print "KSU_GIT_VERSION_VALID := 1"
+        print ""
+        injected=1
+      }
+      { print }
+    ' "$KB" > "$KB.ktmp" && mv "$KB.ktmp" "$KB"
+    echo "--- Kbuild version block AFTER bake (KSU_GIT_VERSION=$KSU_CNT -> KSU_VERSION=$(expr 30000 + "$KSU_CNT"), tag=$KSU_TAG) ---"
+    grep -nE 'Kurumi|KSU_GIT_VERSION|KSU_GIT_TAG|KSU_GIT_VERSION_VALID|KernelSU-Next version' "$KB" || true
+  else
+    echo "WARN: KernelSU-Next Kbuild not found or count too small (KB='$KB' KSU_CNT='$KSU_CNT') -> version NOT baked."
+  fi
+}
+
+cat > /tmp/kurumi_repair_namespace.py <<'PY_NS'
+from pathlib import Path
+import re, sys
+p = Path('common/fs/namespace.c')
+r = Path('common/fs/namespace.c.rej')
+if not p.exists() or not r.exists():
+    sys.exit(1)
+s = p.read_text(errors='ignore')
+rej = r.read_text(errors='ignore')
+changed = False
+if 'CL_COPY_MNT_NS' not in rej and 'susfs_def.h' not in rej:
+    sys.exit(1)
+if '#include <linux/susfs_def.h>' not in s:
+    if '#include <linux/mnt_idmapping.h>\n' in s:
+        s = s.replace('#include <linux/mnt_idmapping.h>\n', '#include <linux/mnt_idmapping.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n', 1)
+        changed = True
+    else:
+        m = re.search(r'(#include <linux/[^>]+>\n)(?=\n|#include "internal.h")', s)
+        if m:
+            s = s[:m.end()] + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n' + s[m.end():]
+            changed = True
+need = []
+for token, decl in [
+    ('susfs_is_current_ksu_domain(', 'extern bool susfs_is_current_ksu_domain(void);'),
+    ('susfs_is_sdcard_android_data_not_decrypted', 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;'),
+    ('susfs_is_boot_completed_triggered', 'extern bool susfs_is_boot_completed_triggered;'),
+    ('susfs_ksu_mnt_group_ida', 'extern struct ida susfs_ksu_mnt_group_ida;'),
+    ('susfs_ksu_mounts', 'extern atomic64_t susfs_ksu_mounts;'),
+]:
+    if token in s and decl not in s:
+        need.append(decl)
+if 'CL_COPY_MNT_NS' in s and '#define CL_COPY_MNT_NS BIT(25)' not in s:
+    need.append('#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */')
+if need:
+    block = '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n' + '\n'.join(need) + '\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n'
+    anchors = ['static unsigned int m_hash_mask __read_mostly;', 'static struct kmem_cache *mnt_cache __ro_after_init;', 'unsigned int sysctl_mount_max __read_mostly']
+    for a in anchors:
+        idx = s.find(a)
+        if idx >= 0:
+            s = s[:idx] + block + s[idx:]
+            changed = True
+            break
+if changed:
+    p.write_text(s)
+    print('namespace repair: applied')
+    sys.exit(0)
+print('namespace repair: nothing changed')
+sys.exit(1)
+PY_NS
+
+cat > /tmp/kurumi_repair_after_susfs.py <<'PY_REPAIR'
+from pathlib import Path
+import re, sys
+root = Path('common')
+changed_any = False
+
+def rw(path, fn):
+    global changed_any
+    p = Path(path)
+    if not p.exists():
+        return
+    old = p.read_text(errors='ignore')
+    new = fn(old)
+    if new != old:
+        p.write_text(new)
+        changed_any = True
+        print('KSU+susfs repair:', p, 'fixed')
+
+# Common namespace safety for android14-6.1 moving include/anchor positions.
+def fix_namespace(s):
+    if 'CONFIG_KSU_SUSFS' not in s and 'susfs_' not in s:
+        return s
+    if '#include <linux/susfs_def.h>' not in s and any(x in s for x in ('susfs_is_current_ksu_domain', 'susfs_is_sdcard_android_data_not_decrypted', 'susfs_is_boot_completed_triggered', 'susfs_ksu_mnt_group_ida', 'susfs_ksu_mounts', 'DEFAULT_KSU_MNT_ID')):
+        anchor = '#include <linux/mnt_idmapping.h>\n'
+        if anchor in s:
+            s = s.replace(anchor, anchor + '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n', 1)
+    need = []
+    pairs = [
+        ('susfs_is_current_ksu_domain(', 'extern bool susfs_is_current_ksu_domain(void);'),
+        ('susfs_is_sdcard_android_data_not_decrypted', 'extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;'),
+        ('susfs_is_boot_completed_triggered', 'extern bool susfs_is_boot_completed_triggered;'),
+        ('susfs_ksu_mnt_group_ida', 'extern struct ida susfs_ksu_mnt_group_ida;'),
+        ('susfs_ksu_mounts', 'extern atomic64_t susfs_ksu_mounts;'),
+    ]
+    for token, decl in pairs:
+        if token in s and decl not in s:
+            need.append(decl)
+    if 'CL_COPY_MNT_NS' in s and '#define CL_COPY_MNT_NS BIT(25)' not in s:
+        need.append('#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */')
+    if need:
+        block = '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n' + '\n'.join(need) + '\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n'
+        for anchor in ('static unsigned int m_hash_mask __read_mostly;', 'static struct kmem_cache *mnt_cache __ro_after_init;', 'unsigned int sysctl_mount_max __read_mostly'):
+            idx = s.find(anchor)
+            if idx >= 0:
+                s = s[:idx] + block + s[idx:]
+                break
+    return s
+
+rw(root/'fs/namespace.c', fix_namespace)
+
+# Some susfs4ksu history revisions rename hide-sus-mount APIs. Map only when the
+# target API is really present in the copied headers/source.
+sus_text = ''
+for p in (root/'fs/susfs.c', root/'include/linux/susfs.h', root/'include/linux/susfs_def.h'):
+    if p.exists():
+        sus_text += p.read_text(errors='ignore') + '\n'
+
+def fix_c_file(s):
+    if 'susfs_' not in s and 'CMD_SUSFS_' not in s and 'pr_info(' not in s:
+        return s
+    # Fix accidental literal newlines inside common pr_info format strings if a prior repair produced them.
+    s = s.replace('pr_info("sys_reboot: ppptr: 0x%lx \n",', 'pr_info("sys_reboot: ppptr: 0x%lx\\n",')
+    s = s.replace('pr_info("sys_reboot: u_pptr: 0x%llx \n",', 'pr_info("sys_reboot: u_pptr: 0x%llx\\n",')
+    s = s.replace('pr_info("sys_reboot: u_ptr: 0x%llx \n",', 'pr_info("sys_reboot: u_ptr: 0x%llx\\n",')
+    if 'susfs_set_hide_sus_mnts_for_non_su_procs' in s and 'susfs_set_hide_sus_mnts_for_non_su_procs' not in sus_text and 'susfs_set_hide_sus_mnts_for_all_procs' in sus_text:
+        s = s.replace('susfs_set_hide_sus_mnts_for_non_su_procs', 'susfs_set_hide_sus_mnts_for_all_procs')
+        s = s.replace('CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS', 'CMD_SUSFS_HIDE_SUS_MNTS_FOR_ALL_PROCS')
+    if 'susfs_' in s and '#include <linux/susfs.h>' not in s and ('CMD_SUSFS_' in s or 'susfs_set_' in s or 'susfs_add_' in s):
+        m = re.search(r'(\n#include [^\n]+\n)', s)
+        if m:
+            s = s[:m.end()] + '#include <linux/susfs.h>\n' + s[m.end():]
+    return s
+
+for p in list((root/'drivers/kernelsu').rglob('*.c')) + list((root/'KernelSU-Next/kernel').rglob('*.c')) + list((root/'KernelSU/kernel').rglob('*.c')):
+    rw(p, fix_c_file)
+
+# Ensure KSU_SUSFS defaults to y for CI non-interactive defconfig.
+for kc in list((root/'drivers/kernelsu').rglob('Kconfig')) + list((root/'KernelSU-Next/kernel').glob('Kconfig')) + list((root/'KernelSU/kernel').glob('Kconfig')):
+    txt = kc.read_text(errors='ignore')
+    if 'config KSU_SUSFS' not in txt:
+        continue
+    lines = txt.split('\n')
+    out = []
+    in_blk = False
+    for line in lines:
+        if re.match(r'\s*config\s+KSU_SUSFS\b', line):
+            in_blk = True
+        elif re.match(r'\s*config\s+', line) and not re.match(r'\s*config\s+KSU_SUSFS\b', line):
+            in_blk = False
+        if in_blk and re.match(r'\s*default\s+n\s*$', line):
+            line = re.sub(r'default\s+n', 'default y', line)
+        out.append(line)
+    new = '\n'.join(out)
+    if new != txt:
+        kc.write_text(new)
+        changed_any = True
+        print('KSU+susfs repair:', kc, 'KSU_SUSFS default y')
+
+print('KSU+susfs repair pass complete; changed=', changed_any)
+PY_REPAIR
+
+# 1) Install current KernelSU-Next first. For KSU+SuSFS, default to the latest
+# tagged release (same cadence as Manager releases). Explicit branch/tag still
+# works by setting KSU_SUSFS_REF, e.g. next/stable/dev/vX.Y.Z.
+KSU_REQ="${KSU_SUSFS_REF:-latest}"
+echo "KSU+susfs: KernelSU-Next request: $KSU_REQ"
+if [ -n "$KSU_REQ" ] && [ "$KSU_REQ" != "auto" ] && [ "$KSU_REQ" != "latest" ]; then
+  ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_REQ" )
+else
+  ( cd common && curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash )
+fi
+ksu_rc=$?
+if [ "$ksu_rc" != 0 ]; then
+  echo "WARN: KernelSU-Next setup failed (ksu_rc=$ksu_rc) - KSU+susfs variant skipped."
+  exit 0
+fi
+
+KSU_REPO="common/KernelSU-Next"
+[ -d "$KSU_REPO" ] || KSU_REPO="common/KernelSU"
+[ -d "$KSU_REPO" ] || { echo "WARN: KernelSU repo not found after setup - KSU+susfs variant skipped."; exit 0; }
+KSU_CNT="$(git -C "$KSU_REPO" rev-list --count HEAD 2>/dev/null || echo 0)"
+KSU_VER="$((30000 + KSU_CNT))"
+KSU_TAG="$(git -C "$KSU_REPO" describe --tags --abbrev=0 2>/dev/null || git -C "$KSU_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo "KSU+susfs: KernelSU-Next selected tag/ref: $KSU_TAG; commit_count=$KSU_CNT; KSU_VERSION=$KSU_VER"
+if [ "${KSU_CNT:-0}" -lt 500 ]; then
+  echo "WARN: KernelSU-Next history too shallow ($KSU_CNT) -> driver would report bad version. Skipping KSU+susfs variant."
+  exit 0
+fi
+if [ "$KSU_VER" -lt "${KSU_SUSFS_MIN_VERSION:-33188}" ] && [ "${KSU_SUSFS_ALLOW_OLD:-false}" != true ]; then
+  echo "WARN: KernelSU-Next KSU_VERSION=$KSU_VER is below manager minimum ${KSU_SUSFS_MIN_VERSION:-33188}; KSU+susfs variant skipped."
+  exit 0
+fi
+
+# 2) Clone SuSFS separately. Prefer latest version-bump commit on the branch,
+# because upstream README says tag/release tag or a 'Bump version to vX.X.X'
+# commit usually patches cleaner than an arbitrary moving HEAD. Explicit
+# SUSFS_REF can override this.
+rm -rf susfs4ksu
+git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "${SUSFS_BRANCH:-gki-android14-6.1}" susfs4ksu
+sus_clone_rc=$?
+if [ "$sus_clone_rc" != 0 ]; then
+  echo "WARN: failed to clone susfs4ksu (rc=$sus_clone_rc) - KSU+susfs variant skipped."
+  exit 0
+fi
+SUS_REQ="${SUSFS_REF:-latest-bump}"
+if [ -n "$SUS_REQ" ] && [ "$SUS_REQ" != "auto" ] && [ "$SUS_REQ" != "latest" ] && [ "$SUS_REQ" != "latest-bump" ]; then
+  git -C susfs4ksu checkout "$SUS_REQ" || { echo "WARN: requested SUSFS_REF '$SUS_REQ' not found - KSU+susfs variant skipped."; exit 0; }
+else
+  BUMP="$(git -C susfs4ksu log --grep='Bump version to v' -n 1 --format='%H' 2>/dev/null)"
+  if [ -n "$BUMP" ]; then
+    git -C susfs4ksu checkout "$BUMP"
+    echo "KSU+susfs: selected latest susfs4ksu version-bump commit: $(git -C susfs4ksu log -1 --oneline)"
+  else
+    echo "KSU+susfs: no 'Bump version to vX.X.X' commit found; using branch HEAD: $(git -C susfs4ksu rev-parse --short HEAD)"
+  fi
+fi
+
+echo "KSU+susfs: using susfs4ksu revision: $(git -C susfs4ksu rev-parse --short HEAD)"
+SUS="$PWD/susfs4ksu/kernel_patches"
+KSU_PATCH="$SUS/KernelSU/10_enable_susfs_for_ksu.patch"
+[ -f "$KSU_PATCH" ] || { echo "WARN: KSU-side SuSFS patch missing: $KSU_PATCH"; exit 0; }
+
+# 3) Apply KSU-side SuSFS patch to the actual KernelSU-Next repository.
+(
+  cd "$KSU_REPO" && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$KSU_PATCH"
+)
+ksu_patch_rc=$?
+KSU_REJ="$(cd "$KSU_REPO" && find . -name '*.rej' 2>/dev/null | sort)"
+if [ "$ksu_patch_rc" != 0 ] || [ -n "$KSU_REJ" ]; then
+  echo '=================== KSU-side susfs .rej DUMP ==================='
+  for r in $KSU_REJ; do echo "----- $KSU_REPO/$r -----"; sed -n '1,180p' "$KSU_REPO/$r"; done
+  echo '================================================================='
+  echo "WARN: KSU-side susfs patch did NOT apply cleanly to current KernelSU-Next ($KSU_TAG)."
+  echo "WARN: This is an upstream API drift; keeping it non-fatal and skipping KSU+susfs variant."
+  exit 0
+fi
+
+grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_REPO/kernel" common/drivers/kernelsu 2>/dev/null || {
+  echo "WARN: KSU_SUSFS Kconfig symbol not found after KSU-side patch - KSU+susfs variant skipped."
+  exit 0
+}
+
+# 4) Copy SuSFS common payload and apply the android14-6.1 common patch.
+SUS_COMMON_PATCH="$SUS/50_add_susfs_in_gki-android14-6.1.patch"
+if [ ! -f "$SUS_COMMON_PATCH" ]; then
+  SUS_COMMON_PATCH="$(find "$SUS" -maxdepth 1 -type f \( -name '50_add_susfs_in_gki-android14-6.1.patch' -o -name '50_add_susfs_in_kernel-6.1*.patch' -o -name '50_add_susfs*.patch' \) | head -1)"
+fi
+[ -f "$SUS_COMMON_PATCH" ] || { echo "WARN: susfs common patch missing for android14-6.1"; exit 0; }
+cp -v "$SUS"/fs/* common/fs/ 2>/dev/null
+cp -v "$SUS"/include/linux/* common/include/linux/ 2>/dev/null
+(
+  cd common && patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUS_COMMON_PATCH"
+)
+sus_rc=$?
+REJ="$(cd common && find . -name '*.rej' 2>/dev/null | sort)"
+if [ "$sus_rc" != 0 ] || [ -n "$REJ" ]; then
+  echo '=================== common susfs .rej DUMP ==================='
+  for r in $REJ; do echo "----- common/$r -----"; sed -n '1,180p' "common/$r"; done
+  echo '==============================================================='
+  if [ "$REJ" = "./fs/namespace.c.rej" ] && python3 /tmp/kurumi_repair_namespace.py; then
+    rm -f common/fs/namespace.c.rej
+    REJ="$(cd common && find . -name '*.rej' 2>/dev/null | sort)"
+    if [ -z "$REJ" ]; then
+      echo "KSU+susfs: repaired known fs/namespace.c hunk reject; continuing."
+      sus_rc=0
+    fi
+  fi
+  if [ "$sus_rc" != 0 ] || [ -n "$REJ" ]; then
+    echo "WARN: susfs common kernel patch did NOT apply cleanly -> KSU+susfs variant skipped."
+    ( cd common && find . -name '*.rej' -delete; find . -name '*.orig' -delete ) 2>/dev/null
+    exit 0
+  fi
+fi
+
+python3 /tmp/kurumi_repair_after_susfs.py || {
+  echo "WARN: KSU+susfs post-patch repair failed -> variant skipped."
+  exit 0
+}
+
+# One more explicit non-interactive enable pass.
+for kc in $(grep -rlE 'config[[:space:]]+KSU_SUSFS' "$KSU_REPO/kernel" common/drivers/kernelsu common 2>/dev/null | sort -u); do
+  echo "susfs: flipping defaults to y in $kc"
+  awk '
+    /^[[:space:]]*config[[:space:]]+KSU_SUSFS/ {blk=1}
+    /^[[:space:]]*config[[:space:]]/ && $0 !~ /^[[:space:]]*config[[:space:]]+KSU_SUSFS/ {blk=0}
+    { if (blk && $0 ~ /^[[:space:]]*default[[:space:]]+n[[:space:]]*$/) sub(/default[[:space:]]+n/,"default y"); print }
+  ' "$kc" > "$kc.ktmp" && mv "$kc.ktmp" "$kc"
+done
+
+grep -Rqs 'config[[:space:]]\+KSU_SUSFS' "$KSU_REPO/kernel" common/drivers/kernelsu common 2>/dev/null || {
+  echo "WARN: KSU_SUSFS Kconfig symbol not present after all patches - KSU+susfs variant skipped."
+  exit 0
+}
+
+bake_ksu_version
+
+echo "$KSU_TAG" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ref"
+echo "$KSU_VER" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_version"
+echo "$KSU_CNT" > "$GITHUB_WORKSPACE/kimg/ksu_susfs_commit_count"
+echo ok > "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
+echo "KSU+susfs integration OK -> building variant 3."
+set +x
+exit 0
