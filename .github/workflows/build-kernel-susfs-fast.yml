@@ -488,10 +488,19 @@ jobs:
           if [ -z "$CFG" ]; then
             echo 'WARN: extract-ikconfig returned empty config; cannot assert CONFIG_KSU_SUSFS.'
           else
-            echo "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
-            echo "$CFG" | grep -q '^CONFIG_KSU=y' || { echo 'ERROR: CONFIG_KSU=y not found in Image'; exit 1; }
-            echo "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y' || { echo 'ERROR: CONFIG_KSU_SUSFS=y not found in Image'; exit 1; }
+            printf '%s\n' "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_KSU=y' || { echo 'ERROR: CONFIG_KSU=y not found in Image'; exit 1; }
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y' || { echo 'ERROR: CONFIG_KSU_SUSFS=y not found in Image'; exit 1; }
             echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y are baked into the fast Image.'
+          fi
+          SMAP="$DIST/System.map"
+          if [ -f "$SMAP" ]; then
+            grep -E ' susfs_(init|show_version|get_enabled_features|show_variant)$| ksu_handle_sys_reboot$' "$SMAP" || true
+            grep -q ' susfs_show_version$' "$SMAP" || { echo 'ERROR: susfs_show_version symbol not found in System.map'; exit 1; }
+            grep -q ' ksu_handle_sys_reboot$' "$SMAP" || { echo 'ERROR: ksu_handle_sys_reboot symbol not found in System.map'; exit 1; }
+            echo 'OK: SuSFS runtime/query symbols are present in System.map.'
+          else
+            echo 'WARN: System.map not found; skipping SuSFS symbol assertion.'
           fi
           mkdir -p "$GITHUB_WORKSPACE/kimg"
           cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
