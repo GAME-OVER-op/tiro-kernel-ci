@@ -104,13 +104,14 @@ case $KR_IDX in
 esac;
 ui_print " " "   -> kernel: $KROOT";
 
-# ---- 1) Battery daemon profile (scrolling cursor menu; 'Skip' = do not install it) ----
-# The daemon runs only under Magisk (its overlay.d rc is imported by magiskinit). On
-# KSU/APatch/no-root it stays dormant and harmless, so we still offer the profiles to
-# everyone and let non-Magisk users pick 'Skip' if they don't want it staged at all.
+# ---- 1) Battery daemon profile (scrolling cursor menu; 'Skip' = remove/do not install it) ----
+# Runtime is decided later after the target ramdisk is inspected:
+#   Magisk present -> overlay.d in boot/init_boot
+#   no Magisk + KSU/SuSFS -> /data/adb/modules/kurumi_kernel
+#   stock without Magisk -> skipped and stale KSU module removed.
 ui_print " ";
 ui_print "------------------------------";
-ui_print " Battery daemon profile (active on Magisk)";
+ui_print " Battery daemon profile";
 ui_print "   Vol Down = move cursor";
 ui_print "   Vol Up   = select";
 ui_print "------------------------------";
@@ -120,7 +121,7 @@ while true; do
   if [ $KP_IDX -eq 0 ]; then ui_print " > Economy - max battery + delayed push"; else ui_print "   Economy - max battery + delayed push"; fi;
   if [ $KP_IDX -eq 1 ]; then ui_print " > Balance - balanced CPU + delayed push"; else ui_print "   Balance - balanced CPU + delayed push"; fi;
   if [ $KP_IDX -eq 2 ]; then ui_print " > Full    - no CPU limits + soft push"; else ui_print "   Full    - no CPU limits + soft push"; fi;
-  if [ $KP_IDX -eq 3 ]; then ui_print " > Skip    - do not install the battery daemon"; else ui_print "   Skip    - do not install the battery daemon"; fi;
+  if [ $KP_IDX -eq 3 ]; then ui_print " > Skip    - remove / do not install daemon"; else ui_print "   Skip    - remove / do not install daemon"; fi;
   if $FUNCTION; then
     break;
   else
