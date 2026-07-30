@@ -33,12 +33,138 @@ no_magisk_check=1
 ## Sets KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full), KSELINUX (permissive|enforcing), KGPU (0|1)
 . $home/tools/kurumi_menu.sh
 
+KURUMI_MODULE_DIR=/data/adb/modules/kurumi_kernel
+KURUMI_MAGISK=0
+KURUMI_OVERLAY_CHANGED=0
+
+kurumi_remove_data_module() {
+  if [ -d /data/adb/modules/kurumi_kernel ]; then
+    ui_print " " "Kurumi: removing old KSU module /data/adb/modules/kurumi_kernel";
+    rm -rf /data/adb/modules/kurumi_kernel 2>/dev/null || ui_print " " "WARNING: could not remove old kurumi_kernel module";
+  fi;
+}
+
+kurumi_data_modules_ready() {
+  [ -d /data/adb ] || return 1;
+  mkdir -p /data/adb/modules 2>/dev/null || return 1;
+  [ -d /data/adb/modules ] || return 1;
+  [ -w /data/adb/modules ] || return 1;
+  return 0;
+}
+
+kurumi_install_data_module() {
+  local srcbin;
+  [ "$KPROFILE" = "skip" ] && { kurumi_remove_data_module; return 0; };
+  srcbin="$home/files/kurumi_bin/kurumi_$KPROFILE";
+  [ -f "$srcbin" ] || { ui_print " " "WARNING: kurumi_$KPROFILE not found - KSU module skipped"; return 1; };
+  [ -f "$home/files/kurumi_module/module.prop" ] || { ui_print " " "WARNING: kurumi module.prop missing - KSU module skipped"; return 1; };
+  [ -f "$home/files/kurumi_module/service.sh" ] || { ui_print " " "WARNING: kurumi service.sh missing - KSU module skipped"; return 1; };
+  if ! kurumi_data_modules_ready; then
+    ui_print " " "WARNING: /data/adb/modules is not writable - Kurumi daemon module skipped";
+    return 1;
+  fi;
+  ui_print " " "Kurumi: installing daemon as KSU module ($KPROFILE)";
+  rm -rf "$KURUMI_MODULE_DIR" 2>/dev/null;
+  mkdir -p "$KURUMI_MODULE_DIR" || { ui_print " " "WARNING: cannot create $KURUMI_MODULE_DIR"; return 1; };
+  cp -f "$home/files/kurumi_module/module.prop" "$KURUMI_MODULE_DIR/module.prop" || return 1;
+  cp -f "$home/files/kurumi_module/service.sh" "$KURUMI_MODULE_DIR/service.sh" || return 1;
+  cp -f "$srcbin" "$KURUMI_MODULE_DIR/kurumi" || return 1;
+  chown -R 0:0 "$KURUMI_MODULE_DIR" 2>/dev/null;
+  chmod 0755 "$KURUMI_MODULE_DIR" 2>/dev/null;
+  chmod 0644 "$KURUMI_MODULE_DIR/module.prop" 2>/dev/null;
+  chmod 0755 "$KURUMI_MODULE_DIR/service.sh" "$KURUMI_MODULE_DIR/kurumi" 2>/dev/null;
+  chcon -R u:object_r:adb_data_file:s0 "$KURUMI_MODULE_DIR" 2>/dev/null || /system/bin/chcon -R u:object_r:adb_data_file:s0 "$KURUMI_MODULE_DIR" 2>/dev/null || true;
+  ui_print " " "Kurumi: KSU module installed to $KURUMI_MODULE_DIR";
+}
+
+kurumi_stage_overlay_profile() {
+  rm -rf "$home/kurumi_overlay";
+  [ "$KPROFILE" = "skip" ] && return 1;
+  [ -d "$home/kurumi_overlay_template" ] || { ui_print " " "WARNING: overlay.d template missing - Magisk daemon skipped"; return 1; };
+  [ -f "$home/files/kurumi_bin/kurumi_$KPROFILE" ] || { ui_print " " "WARNING: kurumi_$KPROFILE not found - Magisk daemon skipped"; return 1; };
+  cp -rf "$home/kurumi_overlay_template" "$home/kurumi_overlay";
+  mkdir -p "$home/kurumi_overlay/sbin";
+  cp -f "$home/files/kurumi_bin/kurumi_$KPROFILE" "$home/kurumi_overlay/sbin/kurumi_battery";
+  ui_print " " "Kurumi: staged '$KPROFILE' daemon profile for Magisk overlay.d";
+  return 0;
+}
+
 install_overlayd() {
   [ -d "$home/kurumi_overlay" ] || return 0;
   mkdir -p "$ramdisk/overlay.d/sbin";
   cp -rf "$home/kurumi_overlay/." "$ramdisk/overlay.d/";
   set_perm_recursive 0 0 755 644 "$ramdisk/overlay.d";
   set_perm_recursive 0 0 755 755 "$ramdisk/overlay.d/sbin";
+}
+
+kurumi_remove_overlayd() {
+  KURUMI_OVERLAY_CHANGED=0;
+  if [ -f "$ramdisk/overlay.d/init.kurumi.rc" ]; then
+    rm -f "$ramdisk/overlay.d/init.kurumi.rc";
+    KURUMI_OVERLAY_CHANGED=1;
+  fi;
+  if [ -f "$ramdisk/overlay.d/sbin/kurumi_battery" ]; then
+    rm -f "$ramdisk/overlay.d/sbin/kurumi_battery";
+    KURUMI_OVERLAY_CHANGED=1;
+  fi;
+  rmdir "$ramdisk/overlay.d/sbin" "$ramdisk/overlay.d" 2>/dev/null || true;
+}
+
+kurumi_detect_magisk_ramdisk() {
+  local rc;
+  KURUMI_MAGISK=0;
+  if [ -f "$split_img/ramdisk.cpio" ]; then
+    "$bin"/magiskboot cpio "$split_img/ramdisk.cpio" test >/dev/null 2>&1;
+    rc=$?;
+    [ $((rc & 3)) -eq 1 ] && KURUMI_MAGISK=1;
+  fi;
+  if [ -f "$ramdisk/.backup/.magisk" ] || [ -f "$ramdisk/.magisk" ]; then
+    KURUMI_MAGISK=1;
+  fi;
+  if [ "$KURUMI_MAGISK" = "1" ]; then
+    ui_print " " "Kurumi: Magisk ramdisk/runtime detected";
+  else
+    ui_print " " "Kurumi: Magisk not detected";
+  fi;
+}
+
+kurumi_finalize_daemon_for_current_ramdisk() {
+  kurumi_detect_magisk_ramdisk;
+
+  if [ "$KURUMI_MAGISK" = "1" ]; then
+    # Magisk path has priority. Remove the KSU module to avoid a double daemon.
+    kurumi_remove_data_module;
+    kurumi_remove_overlayd;
+    if [ "$KPROFILE" = "skip" ]; then
+      ui_print " " "Kurumi: daemon skipped - Magisk overlay.d removed if present";
+      return 0;
+    fi;
+    if kurumi_stage_overlay_profile; then
+      install_overlayd;
+      KURUMI_OVERLAY_CHANGED=1;
+      ui_print " " "Kurumi: daemon will run through Magisk overlay.d";
+    else
+      ui_print " " "WARNING: Magisk detected but daemon overlay could not be staged";
+    fi;
+    return 0;
+  fi;
+
+  # No Magisk: keep the ramdisk clean. KSU/SuSFS can run the daemon from /data/adb/modules.
+  kurumi_remove_overlayd;
+  case "$KROOT" in
+    ksu|susfs)
+      if [ "$KPROFILE" = "skip" ]; then
+        kurumi_remove_data_module;
+        ui_print " " "Kurumi: daemon skipped - KSU module removed if present";
+      else
+        kurumi_install_data_module || true;
+      fi;
+      ;;
+    *)
+      kurumi_remove_data_module;
+      ui_print " " "Kurumi: stock kernel without Magisk - daemon skipped";
+      ;;
+  esac;
 }
 
 ## SELinux: patch the kernel cmdline to the chosen mode
@@ -50,29 +176,23 @@ apply_selinux() {
   fi;
 }
 
-## Battery daemon (overlay.d). If the user picked 'Skip' in the profile menu we install
-## NOTHING (no kurumi_overlay -> install_overlayd is a no-op and the init_boot overlay pass
-## is skipped). Otherwise the overlay is baked into init_boot UNCONDITIONALLY: it only runs
-## under Magisk (magiskinit imports overlay.d); on KSU/APatch/no-root it stays dormant and
-## harmless (stock init ignores /overlay.d), so it cannot break boot.
-if [ "$KPROFILE" = "skip" ]; then
-  rm -rf "$home/kurumi_overlay";
-  ui_print " " "Kurumi: battery daemon skipped (no overlay installed)";
-else
-  ## Stash overlay.d before any reset wipes the shipped ramdisk dir
-  if [ -d "$home/ramdisk/overlay.d" ]; then
-    cp -rf "$home/ramdisk/overlay.d" "$home/kurumi_overlay";
-  fi;
-  ## Install the selected CPU-profile binary as the daemon (kurumi_battery).
-  ## CI ships all three in files/kurumi_bin/; init.kurumi.rc launches kurumi_battery.
-  mkdir -p "$home/kurumi_overlay/sbin";
-  if [ -f "$home/files/kurumi_bin/kurumi_$KPROFILE" ]; then
-    cp -f "$home/files/kurumi_bin/kurumi_$KPROFILE" "$home/kurumi_overlay/sbin/kurumi_battery";
-    ui_print " " "Kurumi: staged '$KPROFILE' battery profile (active only on Magisk)";
-  else
-    ui_print " " "WARNING: kurumi_$KPROFILE not found - battery daemon will NOT be installed";
-    rm -rf "$home/kurumi_overlay";
-  fi;
+## ---- Kurumi daemon runtime routing ----
+## Keep the overlay.d template out of the normal ramdisk auto-merge path.
+## Later, after the target ramdisk is dumped, we choose exactly ONE runtime:
+##   Magisk detected              -> overlay.d in boot/init_boot (existing logic)
+##   no Magisk + KSU/KSU+SuSFS    -> /data/adb/modules/kurumi_kernel
+##   stock without Magisk or Skip -> no daemon, old Kurumi module/overlay removed
+if [ -d "$home/ramdisk/overlay.d" ]; then
+  rm -rf "$home/kurumi_overlay_template";
+  cp -rf "$home/ramdisk/overlay.d" "$home/kurumi_overlay_template";
+  rm -rf "$home/ramdisk/overlay.d";
+  rmdir "$home/ramdisk" 2>/dev/null || true;
+fi;
+
+# If the user selects stock or explicit Skip, clear stale KSU module early.
+# This prevents a previous KSU/SuSFS install from resurrecting the daemon later.
+if [ "$KROOT" = "stock" ] || [ "$KPROFILE" = "skip" ]; then
+  kurumi_remove_data_module;
 fi;
 
 ## GPU frequency table -> staged for the vendor_boot pass below (NOT boot). 'Yes' stages the
@@ -134,24 +254,27 @@ if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" ] || [ -e "/dev/block/by-
   split_boot;
   apply_selinux;
   flash_boot;
-  if [ -d "$home/kurumi_overlay" ]; then
-    ui_print " " "Kurumi: installing in-kernel battery tweak (overlay.d) into init_boot...";
-    rm -f "$home"/Image "$home"/Image.gz "$home"/Image-dtb "$home"/Image.gz-dtb "$home"/zImage "$home"/zImage-dtb;
-    reset_ak;
-    block=init_boot;
-    setup_ak;
-    dump_boot;
-    install_overlayd;
+
+  ## Inspect init_boot for Magisk, then either install overlay.d, install a KSU
+  ## module, or remove stale Kurumi daemon files. Do not keep overlay.d and
+  ## /data/adb/modules/kurumi_kernel active at the same time.
+  ui_print " " "Kurumi: checking init_boot for Magisk daemon runtime...";
+  rm -f "$home"/Image "$home"/Image.gz "$home"/Image-dtb "$home"/Image.gz-dtb "$home"/zImage "$home"/zImage-dtb;
+  reset_ak;
+  block=init_boot;
+  setup_ak;
+  dump_boot;
+  kurumi_finalize_daemon_for_current_ramdisk;
+  if [ "$KURUMI_MAGISK" = "1" ] || [ "$KURUMI_OVERLAY_CHANGED" = "1" ]; then
     write_boot;
+  else
+    ui_print " " "Kurumi: init_boot left unchanged (no Magisk overlay needed)";
   fi;
 else
   ## ---- legacy: kernel + ramdisk both in boot -> single pass ----
   dump_boot;
   apply_selinux;
-  if [ -d "$home/kurumi_overlay" ]; then
-    ui_print " " "Kurumi: installing in-kernel battery tweak (overlay.d) into boot...";
-    install_overlayd;
-  fi;
+  kurumi_finalize_daemon_for_current_ramdisk;
   write_boot;
 fi;
 ## ---- GPU dtb -> vendor_boot (independent of kernel; runs for BOTH 'custom' and 'stock') ----
