@@ -74,3 +74,7 @@ Only after it is proven stable, flash `Kurumi_kernel_build<N>.zip` in recovery.
 
 ## License
 MIT (see `anykernel/LICENSE`).
+
+## Kurumi Power Monitor
+
+The Rust daemon includes a low-rate consumption recorder. It stores history under `/data/adb/kurumi_monitor/`, creates a separate boot session for each `/proc/sys/kernel/random/boot_id`, takes one baseline after boot and then one snapshot per hour. Reports are raw TSV tables without verdicts. See `docs/KURUMI_POWER_MONITOR.md`.
