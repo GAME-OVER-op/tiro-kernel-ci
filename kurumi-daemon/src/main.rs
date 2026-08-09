@@ -4,8 +4,9 @@
 // Replaces the old shell `kurumi_battery`. Pure std (no external crates) so it
 // builds to a fully-static aarch64 musl binary that runs on Android bionic.
 //
-// It writes ONLY to /sys and /proc -> fully reversible, no partition writes,
-// NO kernel-source changes. No logging (settings are just applied).
+// It writes profile tunables to /sys and /proc only, and stores optional
+// read-only power history under /data/adb/kurumi_monitor. No partition writes,
+// no kernel-source changes, no wakelock held by the monitor.
 //
 // Behaviour:
 //   Once at start (after a short wait so vendor thermal services are up):
@@ -33,14 +34,14 @@
 //       silently re-applies if something restored them).
 // =====================================================================
 
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---- thermal zones (exact IDs from the device / mora reference) ----
 const CPU_ZONE_IDS: &[u32] = &[
@@ -65,6 +66,7 @@ const BURST_INTERVAL_SECS: u64 = 60;
 const STEADY_TICK_SECS: u64 = 3600;
 const WALT_STEADY_SECS: u64 = 3 * 3600;
 const THERMAL_RECHECK_SECS: u64 = 10 * 3600;
+const MONITOR_INTERVAL_SECS: u64 = 3600;
 
 // ---------- sysfs helpers ----------
 
@@ -571,9 +573,724 @@ fn spawn_touch_threads(last: Arc<Mutex<Instant>>) {
     }
 }
 
+
+// ---------- hourly power monitor / boot-session recorder ----------
+// This is intentionally userspace-only. The kernel remains a source of counters;
+// it never writes /data. The daemon samples once per hour, plus a baseline after
+// boot_completed, and stores history by boot_id so counters from different boots
+// are never mixed.
+
+const MONITOR_ROOT: &str = "/data/adb/kurumi_monitor";
+const MONITOR_VERSION: &str = "1";
+
+#[cfg(feature = "eco")]
+const KURUMI_PROFILE: &str = "eco";
+#[cfg(feature = "balance")]
+const KURUMI_PROFILE: &str = "balance";
+#[cfg(feature = "full")]
+const KURUMI_PROFILE: &str = "full";
+
+#[derive(Clone)]
+struct PowerMonitor {
+    enabled: bool,
+    root: PathBuf,
+    boot_id: String,
+    boot_dir: PathBuf,
+    snapshot_seq: u64,
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_trim<P: AsRef<Path>>(path: P) -> String {
+    fs::read_to_string(path)
+        .map(|s| s.trim_matches(|c| c == '\n' || c == '\r' || c == '\0').to_string())
+        .unwrap_or_default()
+}
+
+fn read_first_existing(paths: &[&str]) -> String {
+    for p in paths {
+        let s = read_trim(p);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    String::new()
+}
+
+fn tsv_escape(s: &str) -> String {
+    s.replace('\t', " ")
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .replace('\0', " ")
+}
+
+fn append_tsv(path: &Path, header: &str, row: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let need_header = !path.exists() || fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut f = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if need_header {
+        let _ = writeln!(f, "{}", header);
+    }
+    writeln!(f, "{}", row).is_ok()
+}
+
+fn command_output(cmd: &str, args: &[&str]) -> String {
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn uptime_secs() -> u64 {
+    read_trim("/proc/uptime")
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn boot_id() -> String {
+    let id = read_trim("/proc/sys/kernel/random/boot_id");
+    if !id.is_empty() {
+        return id;
+    }
+    format!("unknown-{}", now_epoch_secs())
+}
+
+fn android_prop(key: &str) -> String {
+    command_output("getprop", &[key])
+}
+
+fn screen_state() -> String {
+    let mut saw_backlight = false;
+    let roots = ["/sys/class/backlight", "/sys/class/leds/lcd-backlight"];
+    for root in roots {
+        if let Ok(entries) = fs::read_dir(root) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let b = read_trim(p.join("actual_brightness"));
+                let b = if b.is_empty() { read_trim(p.join("brightness")) } else { b };
+                if b.is_empty() {
+                    continue;
+                }
+                saw_backlight = true;
+                if b.parse::<i64>().unwrap_or(0) > 0 {
+                    return "on".to_string();
+                }
+            }
+        }
+    }
+    if saw_backlight {
+        "off".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn power_supply_value(name: &str, field: &str) -> String {
+    read_trim(format!("/sys/class/power_supply/{}/{}", name, field))
+}
+
+fn any_power_online() -> String {
+    let mut online: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name == "battery" {
+                continue;
+            }
+            let val = read_trim(e.path().join("online"));
+            if val == "1" {
+                online.push(name);
+            }
+        }
+    }
+    if online.is_empty() {
+        "none".to_string()
+    } else {
+        online.join(",")
+    }
+}
+
+fn package_map() -> Vec<(String, String)> {
+    let out = command_output("cmd", &["package", "list", "packages", "-U"]);
+    let mut rows = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if !line.starts_with("package:") {
+            continue;
+        }
+        let without = &line[8..];
+        let mut parts = without.split_whitespace();
+        let pkg = parts.next().unwrap_or("").to_string();
+        let mut uid = String::new();
+        for p in parts {
+            if let Some(v) = p.strip_prefix("uid:") {
+                uid = v.to_string();
+                break;
+            }
+        }
+        if !pkg.is_empty() && !uid.is_empty() {
+            rows.push((uid, pkg));
+        }
+    }
+    rows
+}
+
+fn parse_status_uid_rss(status: &str) -> (String, String, String) {
+    let mut uid = String::new();
+    let mut rss_kb = String::new();
+    let mut name = String::new();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Name:") {
+            name = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("Uid:") {
+            uid = rest.split_whitespace().next().unwrap_or("").to_string();
+        } else if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss_kb = rest.split_whitespace().next().unwrap_or("").to_string();
+        }
+    }
+    (uid, rss_kb, name)
+}
+
+fn parse_proc_stat_cpu(stat: &str) -> (String, String) {
+    if let Some(end) = stat.rfind(')') {
+        let after = stat.get(end + 2..).unwrap_or("");
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        // fields[0] is state; utime/stime are Linux stat fields 14/15.
+        let utime = fields.get(11).copied().unwrap_or("");
+        let stime = fields.get(12).copied().unwrap_or("");
+        return (utime.to_string(), stime.to_string());
+    }
+    (String::new(), String::new())
+}
+
+fn parse_proc_io(io: &str) -> (String, String) {
+    let mut read_bytes = String::new();
+    let mut write_bytes = String::new();
+    for line in io.lines() {
+        if let Some(rest) = line.strip_prefix("read_bytes:") {
+            read_bytes = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("write_bytes:") {
+            write_bytes = rest.trim().to_string();
+        }
+    }
+    (read_bytes, write_bytes)
+}
+
+impl PowerMonitor {
+    fn new() -> PowerMonitor {
+        let root = PathBuf::from(MONITOR_ROOT);
+        let id = boot_id();
+        let boot_dir = root.join("boots").join(&id);
+        let enabled = fs::create_dir_all(&boot_dir).is_ok();
+        let mut mon = PowerMonitor {
+            enabled,
+            root,
+            boot_id: id,
+            boot_dir,
+            snapshot_seq: 0,
+        };
+        if mon.enabled {
+            mon.init_boot_session();
+            mon.refresh_package_map();
+            mon.install_report_helper();
+        }
+        mon
+    }
+
+    fn init_boot_session(&mut self) {
+        let boot_file = self.root.join("boot_sessions.tsv");
+        let existing = fs::read_to_string(&boot_file).unwrap_or_default();
+        if existing.contains(&self.boot_id) {
+            self.snapshot_seq = self.count_existing_snapshots();
+            return;
+        }
+        let now = now_epoch_secs();
+        let up = uptime_secs();
+        let boot_start = now.saturating_sub(up);
+        let kernel = read_trim("/proc/sys/kernel/osrelease");
+        let android_build = android_prop("ro.build.fingerprint");
+        let rom = android_prop("ro.build.version.incremental");
+        let row = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            tsv_escape(&self.boot_id),
+            now,
+            boot_start,
+            up,
+            tsv_escape(&kernel),
+            tsv_escape(&android_build),
+            tsv_escape(&rom),
+            KURUMI_PROFILE
+        );
+        append_tsv(
+            &boot_file,
+            "boot_id\tfirst_seen_epoch\tboot_start_epoch\tuptime_sec\tkernel_release\tandroid_build\trom_build\tkurumi_profile",
+            &row,
+        );
+        let meta = self.boot_dir.join("meta.tsv");
+        append_tsv(
+            &meta,
+            "key\tvalue",
+            &format!("monitor_version\t{}", MONITOR_VERSION),
+        );
+        append_tsv(&meta, "key\tvalue", &format!("boot_id\t{}", tsv_escape(&self.boot_id)));
+        append_tsv(&meta, "key\tvalue", &format!("kernel_release\t{}", tsv_escape(&kernel)));
+        append_tsv(&meta, "key\tvalue", &format!("android_build\t{}", tsv_escape(&android_build)));
+        append_tsv(&meta, "key\tvalue", &format!("kurumi_profile\t{}", KURUMI_PROFILE));
+    }
+
+    fn count_existing_snapshots(&self) -> u64 {
+        fs::read_to_string(self.boot_dir.join("snapshots.tsv"))
+            .map(|s| s.lines().skip(1).count() as u64)
+            .unwrap_or(0)
+    }
+
+    fn install_report_helper(&self) {
+        // Helpful for Magisk overlay mode where the daemon binary lives in MAGISKTMP.
+        // Users can later run: /data/adb/kurumi_monitor/kurumi --monitor-report
+        if let Ok(exe) = std::env::current_exe() {
+            let dst = self.root.join("kurumi");
+            let same_file = fs::canonicalize(&exe)
+                .ok()
+                .zip(fs::canonicalize(&dst).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false);
+            if same_file {
+                return;
+            }
+            if fs::copy(exe, &dst).is_ok() {
+                if let Ok(md) = fs::metadata(&dst) {
+                    let mut perm = md.permissions();
+                    perm.set_mode(0o755);
+                    let _ = fs::set_permissions(&dst, perm);
+                }
+            }
+        }
+    }
+
+    fn refresh_package_map(&self) {
+        let path = self.boot_dir.join("packages.tsv");
+        if path.exists() {
+            return;
+        }
+        for (uid, pkg) in package_map() {
+            let row = format!("{}\t{}", tsv_escape(&uid), tsv_escape(&pkg));
+            append_tsv(&path, "uid\tpackage", &row);
+        }
+    }
+
+    fn snapshot(&mut self, reason: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.snapshot_seq += 1;
+        let now = now_epoch_secs();
+        let up = uptime_secs();
+        let snap = self.snapshot_seq;
+        self.write_snapshot_row(snap, now, up, reason);
+        self.collect_wakeup_sources(snap, now);
+        self.collect_interrupts(snap, now);
+        self.collect_network(snap, now);
+        self.collect_thermal(snap, now);
+        self.collect_uid_counters(snap, now);
+        self.collect_processes(snap, now);
+        self.collect_kernel_events(snap, now);
+        let _ = fs::write(self.root.join("last_snapshot_epoch"), format!("{}\n", now));
+    }
+
+    fn write_snapshot_row(&self, snap: u64, now: u64, up: u64, reason: &str) {
+        let capacity = power_supply_value("battery", "capacity");
+        let status = power_supply_value("battery", "status");
+        let current_now = power_supply_value("battery", "current_now");
+        let voltage_now = power_supply_value("battery", "voltage_now");
+        let temp = power_supply_value("battery", "temp");
+        let charge_counter = power_supply_value("battery", "charge_counter");
+        let health = power_supply_value("battery", "health");
+        let power_online = any_power_online();
+        let screen = screen_state();
+        let row = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            snap,
+            now,
+            up,
+            tsv_escape(reason),
+            tsv_escape(&screen),
+            tsv_escape(&power_online),
+            tsv_escape(&capacity),
+            tsv_escape(&status),
+            tsv_escape(&current_now),
+            tsv_escape(&voltage_now),
+            tsv_escape(&temp),
+            tsv_escape(&charge_counter),
+            tsv_escape(&health),
+        );
+        append_tsv(
+            &self.boot_dir.join("snapshots.tsv"),
+            "snapshot_id\tepoch\tuptime_sec\treason\tscreen\tpower_online\tbattery_capacity\tbattery_status\tcurrent_now\tvoltage_now\tbattery_temp\tcharge_counter\thealth",
+            &row,
+        );
+    }
+
+    fn collect_wakeup_sources(&self, snap: u64, now: u64) {
+        let src = read_first_existing(&[
+            "/sys/kernel/debug/wakeup_sources",
+            "/d/wakeup_sources",
+        ]);
+        if src.is_empty() {
+            return;
+        }
+        let path = self.boot_dir.join("wakeup_sources.tsv");
+        for line in src.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let name = cols[0];
+            let active_count = cols.get(1).copied().unwrap_or("");
+            let event_count = cols.get(2).copied().unwrap_or("");
+            let wakeup_count = cols.get(3).copied().unwrap_or("");
+            let expire_count = cols.get(4).copied().unwrap_or("");
+            let active_since = cols.get(5).copied().unwrap_or("");
+            let total_time = cols.get(6).copied().unwrap_or("");
+            let max_time = cols.get(7).copied().unwrap_or("");
+            let last_change = cols.get(8).copied().unwrap_or("");
+            let prevent_suspend = cols.get(9).copied().unwrap_or("");
+            let row = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                snap,
+                now,
+                tsv_escape(name),
+                active_count,
+                event_count,
+                wakeup_count,
+                expire_count,
+                active_since,
+                total_time,
+                max_time,
+                last_change,
+                prevent_suspend,
+            );
+            append_tsv(
+                &path,
+                "snapshot_id\tepoch\tname\tactive_count\tevent_count\twakeup_count\texpire_count\tactive_since_ms\ttotal_time_ms\tmax_time_ms\tlast_change_ms\tprevent_suspend_time_ms",
+                &row,
+            );
+        }
+    }
+
+    fn collect_interrupts(&self, snap: u64, now: u64) {
+        let data = read_trim("/proc/interrupts");
+        if data.is_empty() {
+            return;
+        }
+        let path = self.boot_dir.join("interrupts.tsv");
+        for line in data.lines() {
+            let line = line.trim();
+            if !line.contains(':') || line.starts_with("CPU") {
+                continue;
+            }
+            let mut parts = line.splitn(2, ':');
+            let irq = parts.next().unwrap_or("").trim();
+            let rest = parts.next().unwrap_or("").trim();
+            let cols: Vec<&str> = rest.split_whitespace().collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let mut sum: u64 = 0;
+            let mut idx = 0usize;
+            while idx < cols.len() {
+                if let Ok(v) = cols[idx].parse::<u64>() {
+                    sum = sum.saturating_add(v);
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            let name = cols.get(idx..).map(|s| s.join(" ")).unwrap_or_default();
+            let row = format!("{}\t{}\t{}\t{}\t{}", snap, now, tsv_escape(irq), sum, tsv_escape(&name));
+            append_tsv(&path, "snapshot_id\tepoch\tirq\ttotal_count\tname", &row);
+        }
+    }
+
+    fn collect_network(&self, snap: u64, now: u64) {
+        let base = Path::new("/sys/class/net");
+        let entries = match fs::read_dir(base) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let path = self.boot_dir.join("network.tsv");
+        for e in entries.flatten() {
+            let ifname = e.file_name().to_string_lossy().to_string();
+            let st = e.path().join("statistics");
+            if !st.is_dir() {
+                continue;
+            }
+            let rx_bytes = read_trim(st.join("rx_bytes"));
+            let tx_bytes = read_trim(st.join("tx_bytes"));
+            let rx_packets = read_trim(st.join("rx_packets"));
+            let tx_packets = read_trim(st.join("tx_packets"));
+            let row = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                snap,
+                now,
+                tsv_escape(&ifname),
+                rx_bytes,
+                tx_bytes,
+                rx_packets,
+                tx_packets
+            );
+            append_tsv(&path, "snapshot_id\tepoch\tinterface\trx_bytes\ttx_bytes\trx_packets\ttx_packets", &row);
+        }
+    }
+
+    fn collect_thermal(&self, snap: u64, now: u64) {
+        let entries = match fs::read_dir("/sys/class/thermal") {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let path = self.boot_dir.join("thermal.tsv");
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("thermal_zone") {
+                continue;
+            }
+            let ty = read_trim(e.path().join("type"));
+            let temp = read_trim(e.path().join("temp"));
+            if ty.is_empty() && temp.is_empty() {
+                continue;
+            }
+            let row = format!("{}\t{}\t{}\t{}\t{}", snap, now, tsv_escape(&name), tsv_escape(&ty), tsv_escape(&temp));
+            append_tsv(&path, "snapshot_id\tepoch\tzone\ttype\ttemp", &row);
+        }
+    }
+
+    fn collect_uid_counters(&self, snap: u64, now: u64) {
+        let path = self.boot_dir.join("uid_usage.tsv");
+        let tis = read_trim("/proc/uid_time_in_state");
+        if !tis.is_empty() {
+            for line in tis.lines() {
+                let line = line.trim();
+                if line.is_empty() || !line.contains(':') || line.starts_with("uid") {
+                    continue;
+                }
+                let mut parts = line.splitn(2, ':');
+                let uid = parts.next().unwrap_or("").trim();
+                let vals = parts.next().unwrap_or("");
+                let total: u64 = vals
+                    .split_whitespace()
+                    .filter_map(|v| v.parse::<u64>().ok())
+                    .fold(0u64, |a, b| a.saturating_add(b));
+                let row = format!("{}\t{}\t{}\t{}\t{}", snap, now, tsv_escape(uid), total, tsv_escape(vals));
+                append_tsv(&path, "snapshot_id\tepoch\tuid\ttime_in_state_total\ttime_in_state_raw", &row);
+            }
+        }
+        let uid_io = read_trim("/proc/uid_io/stats");
+        if !uid_io.is_empty() {
+            let io_path = self.boot_dir.join("uid_io.tsv");
+            for line in uid_io.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.is_empty() || cols[0].parse::<u32>().is_err() {
+                    continue;
+                }
+                let row = format!("{}\t{}\t{}", snap, now, tsv_escape(line));
+                append_tsv(&io_path, "snapshot_id\tepoch\tuid_io_raw", &row);
+            }
+        }
+    }
+
+    fn collect_processes(&self, snap: u64, now: u64) {
+        let entries = match fs::read_dir("/proc") {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let path = self.boot_dir.join("processes.tsv");
+        for e in entries.flatten() {
+            let pid_s = e.file_name().to_string_lossy().to_string();
+            if pid_s.parse::<u32>().is_err() {
+                continue;
+            }
+            let base = e.path();
+            let status = fs::read_to_string(base.join("status")).unwrap_or_default();
+            if status.is_empty() {
+                continue;
+            }
+            let (uid, rss_kb, status_name) = parse_status_uid_rss(&status);
+            let cmdline = fs::read(base.join("cmdline"))
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
+                .unwrap_or_default();
+            let comm = if cmdline.is_empty() { status_name } else { cmdline };
+            let stat = fs::read_to_string(base.join("stat")).unwrap_or_default();
+            let (utime, stime) = parse_proc_stat_cpu(&stat);
+            let io = fs::read_to_string(base.join("io")).unwrap_or_default();
+            let (read_bytes, write_bytes) = parse_proc_io(&io);
+            let row = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                snap,
+                now,
+                tsv_escape(&pid_s),
+                tsv_escape(&uid),
+                tsv_escape(&comm),
+                tsv_escape(&utime),
+                tsv_escape(&stime),
+                tsv_escape(&rss_kb),
+                tsv_escape(&read_bytes),
+                tsv_escape(&write_bytes)
+            );
+            append_tsv(
+                &path,
+                "snapshot_id\tepoch\tpid\tuid\tcmd\tutime_ticks\tstime_ticks\trss_kb\tread_bytes\twrite_bytes",
+                &row,
+            );
+        }
+    }
+
+    fn collect_kernel_events(&self, snap: u64, now: u64) {
+        let out = command_output("dmesg", &[]);
+        if out.is_empty() {
+            return;
+        }
+        let path = self.boot_dir.join("kernel_events.tsv");
+        let keys = [
+            "suspend", "resume", "wakeup", "wlan", "wifi", "cnss", "mhi", "pcie", "thermal",
+            "battery", "charger", "ufs", "wakelock", "irq",
+        ];
+        for line in out.lines().rev().take(400) {
+            let low = line.to_ascii_lowercase();
+            if keys.iter().any(|k| low.contains(k)) {
+                let row = format!("{}\t{}\t{}", snap, now, tsv_escape(line));
+                append_tsv(&path, "snapshot_id\tepoch\tevent", &row);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct BootReport {
+    boot_id: String,
+    first_epoch: u64,
+    last_epoch: u64,
+    snapshots: u64,
+    battery_start: String,
+    battery_end: String,
+    charge_start: String,
+    charge_end: String,
+    max_temp: i64,
+}
+
+fn split_tsv_line(line: &str) -> Vec<&str> {
+    line.split('\t').collect()
+}
+
+fn build_monitor_report() -> Option<PathBuf> {
+    let root = PathBuf::from(MONITOR_ROOT);
+    let boots_root = root.join("boots");
+    let mut reports: Vec<BootReport> = Vec::new();
+    let entries = fs::read_dir(&boots_root).ok()?;
+    for e in entries.flatten() {
+        let boot_id = e.file_name().to_string_lossy().to_string();
+        let snapshots = fs::read_to_string(e.path().join("snapshots.tsv")).unwrap_or_default();
+        let mut br = BootReport { boot_id, max_temp: i64::MIN, ..BootReport::default() };
+        for line in snapshots.lines().skip(1) {
+            let cols = split_tsv_line(line);
+            if cols.len() < 13 {
+                continue;
+            }
+            let epoch = cols[1].parse::<u64>().unwrap_or(0);
+            if br.snapshots == 0 {
+                br.first_epoch = epoch;
+                br.battery_start = cols[6].to_string();
+                br.charge_start = cols[11].to_string();
+            }
+            br.snapshots += 1;
+            br.last_epoch = epoch;
+            br.battery_end = cols[6].to_string();
+            br.charge_end = cols[11].to_string();
+            if let Ok(t) = cols[10].parse::<i64>() {
+                br.max_temp = br.max_temp.max(t);
+            }
+        }
+        if br.snapshots > 0 {
+            reports.push(br);
+        }
+    }
+    reports.sort_by_key(|r| r.first_epoch);
+    fs::create_dir_all(root.join("reports")).ok()?;
+    let out_path = root.join("reports").join(format!("report_{}.tsv", now_epoch_secs()));
+    let mut out = File::create(&out_path).ok()?;
+    let _ = writeln!(out, "# Kurumi Power Monitor report");
+    let _ = writeln!(out, "# No verdicts, raw boot-session summary only");
+    let _ = writeln!(out, "boot_id\tfirst_epoch\tlast_epoch\tduration_sec\tsnapshots\tbattery_start\tbattery_end\tcharge_counter_start\tcharge_counter_end\tmax_battery_temp_raw");
+    for r in reports {
+        let duration = r.last_epoch.saturating_sub(r.first_epoch);
+        let max_temp = if r.max_temp == i64::MIN { String::new() } else { r.max_temp.to_string() };
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            tsv_escape(&r.boot_id),
+            r.first_epoch,
+            r.last_epoch,
+            duration,
+            r.snapshots,
+            tsv_escape(&r.battery_start),
+            tsv_escape(&r.battery_end),
+            tsv_escape(&r.charge_start),
+            tsv_escape(&r.charge_end),
+            max_temp,
+        );
+    }
+    Some(out_path)
+}
+
+fn monitor_cli(args: &[String]) -> bool {
+    if args.len() < 2 {
+        return false;
+    }
+    match args[1].as_str() {
+        "--monitor-snapshot" => {
+            let mut mon = PowerMonitor::new();
+            mon.snapshot("manual");
+            true
+        }
+        "--monitor-report" => {
+            if let Some(path) = build_monitor_report() {
+                println!("{}", path.display());
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 // ---------- main ----------
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if monitor_cli(&args) {
+        return;
+    }
+
+    // Start persistent, low-rate power history. The first sample is only a
+    // boot-session baseline; hourly deltas are interpreted inside the same boot_id.
+    let mut monitor = PowerMonitor::new();
+    monitor.snapshot("boot_baseline");
+
     // Touch-boost threads start immediately; they block on input (~0 CPU idle).
     let last_touch = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
     spawn_touch_threads(Arc::clone(&last_touch));
@@ -599,13 +1316,20 @@ fn main() {
         thread::sleep(Duration::from_secs(BURST_INTERVAL_SECS));
     }
 
-    // Steady state: hourly tick. WALT/VM every 3h, thermal re-check every 10h.
+    // Steady state: hourly tick. WALT/VM every 3h, thermal re-check every 10h,
+    // and Kurumi Power Monitor snapshot exactly once per hour.
     let mut walt_acc: u64 = 0;
     let mut therm_acc: u64 = 0;
+    let mut monitor_acc: u64 = 0;
     loop {
         thread::sleep(Duration::from_secs(STEADY_TICK_SECS));
         walt_acc += STEADY_TICK_SECS;
         therm_acc += STEADY_TICK_SECS;
+        monitor_acc += STEADY_TICK_SECS;
+        if monitor_acc >= MONITOR_INTERVAL_SECS {
+            monitor.snapshot("hourly");
+            monitor_acc = 0;
+        }
         if walt_acc >= WALT_STEADY_SECS {
             apply_walt_vm();
             walt_acc = 0;
