@@ -174,6 +174,10 @@ jobs:
           echo '--- verifying the device-tree symlink resolves ---'
           ls -la msm-kernel/arch/arm64/boot/dts/vendor
           test -e msm-kernel/arch/arm64/boot/dts/vendor
+          echo '--- Kurumi: integrate minimal screen-state sysfs bridge into common ---'
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_screen_state.sh" "$PWD"
+          grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' common/arch/arm64/configs/gki_defconfig || { echo 'ERROR: KURUMI screen config missing'; exit 1; }
+          grep -q 'kurumi_screen_state_from_backlight' common/drivers/video/backlight/backlight.c || { echo 'ERROR: KURUMI backlight hook missing'; exit 1; }
 
       - name: Sanity-check kleaf compatibility (super_image)
         working-directory: /mnt/src/kp/kernel_platform
@@ -375,6 +379,8 @@ jobs:
             echo 'CONFIG_LRU_GEN=y'
             echo 'CONFIG_LRU_GEN_ENABLED=y'
           } >> "$FRAG"
+          echo '--- Kurumi: integrate safe autonomy config into actual common GKI Image ---'
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_power_config.sh" "$PWD"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
           #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
           #   defconfig, to stay clear of the savedefconfig gate. Author identity also shows via
@@ -488,10 +494,31 @@ jobs:
           if [ -z "$CFG" ]; then
             echo 'WARN: extract-ikconfig returned empty config; cannot assert CONFIG_KSU_SUSFS.'
           else
-            printf '%s\n' "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y' || true
+            printf '%s\n' "$CFG" | grep -E '^CONFIG_KSU=y|^CONFIG_KSU_SUSFS=y|^CONFIG_KURUMI_SCREEN_STATE=y' || true
             printf '%s\n' "$CFG" | grep -q '^CONFIG_KSU=y' || { echo 'ERROR: CONFIG_KSU=y not found in Image'; exit 1; }
             printf '%s\n' "$CFG" | grep -q '^CONFIG_KSU_SUSFS=y' || { echo 'ERROR: CONFIG_KSU_SUSFS=y not found in Image'; exit 1; }
-            echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y are baked into the fast Image.'
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' || { echo 'ERROR: CONFIG_KURUMI_SCREEN_STATE=y not found in Image'; exit 1; }
+            echo 'OK: CONFIG_KSU=y, CONFIG_KSU_SUSFS=y and CONFIG_KURUMI_SCREEN_STATE=y are baked into the fast Image.'
+            printf '%s\n' "$CFG" | grep -E '^CONFIG_WQ_POWER_EFFICIENT_DEFAULT=|^CONFIG_LRU_GEN=|^CONFIG_LRU_GEN_ENABLED=|^CONFIG_RCU_LAZY=|^CONFIG_RCU_LAZY_DEFAULT_OFF=' || true
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y' || { echo 'ERROR: CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y not found in Image'; exit 1; }
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_LRU_GEN=y' || { echo 'ERROR: CONFIG_LRU_GEN=y not found in Image'; exit 1; }
+            printf '%s\n' "$CFG" | grep -q '^CONFIG_LRU_GEN_ENABLED=y' || { echo 'ERROR: CONFIG_LRU_GEN_ENABLED=y not found in Image'; exit 1; }
+            if printf '%s\n' "$CFG" | grep -q '^CONFIG_RCU_LAZY_DEFAULT_OFF=y'; then
+              echo 'ERROR: CONFIG_RCU_LAZY_DEFAULT_OFF=y survived in Image'
+              exit 1
+            fi
+            if printf '%s\n' "$CFG" | grep -q '^CONFIG_RCU_LAZY=y'; then
+              echo 'OK: CONFIG_RCU_LAZY=y is enabled and not default-off.'
+            else
+              echo 'WARN: CONFIG_RCU_LAZY did not land in this GKI config; continuing.'
+            fi
+            for bad in CONFIG_UBSAN CONFIG_PM_DEBUG CONFIG_THERMAL_STATISTICS CONFIG_THERMAL_EMULATION; do
+              if printf '%s\n' "$CFG" | grep -q "^${bad}=y"; then
+                echo "ERROR: ${bad}=y survived in fast release/autonomy build."
+                exit 1
+              fi
+            done
+            echo 'OK: fast release/autonomy config checks passed.'
           fi
           SMAP="$DIST/System.map"
           if [ -f "$SMAP" ]; then
