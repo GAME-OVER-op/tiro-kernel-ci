@@ -67,7 +67,8 @@ for sym in \
   NETFILTER_XT_TARGET_TPROXY NETFILTER_XT_MATCH_SOCKET NETFILTER_XT_MATCH_OWNER \
   NETFILTER_XT_TARGET_MARK NETFILTER_XT_MATCH_MARK NETFILTER_XT_TARGET_CONNMARK \
   NETFILTER_XT_MATCH_CONNMARK NETFILTER_XT_TARGET_REDIRECT NETFILTER_XT_TARGET_MASQUERADE \
-  NETFILTER_XT_MATCH_MULTIPORT NETFILTER_XT_MATCH_COMMENT NF_TABLES NFT_TPROXY \
+  NETFILTER_XTABLES NETFILTER_ADVANCED NF_CONNTRACK NF_CONNTRACK_MARK NF_NAT NF_TABLES NF_TABLES_INET NF_TABLES_IPV4 NF_TABLES_IPV6 \
+  NETFILTER_XT_MATCH_MULTIPORT NETFILTER_XT_MATCH_COMMENT NFT_TPROXY \
   NFT_SOCKET NFT_NAT NFT_MASQ NFT_REDIR NFT_CT PACKET PACKET_DIAG \
   UNIX_DIAG INET_DIAG INET_TCP_DIAG SOCK_DIAG NETLINK_DIAG BPF BPF_SYSCALL \
   CGROUP_BPF; do
@@ -157,6 +158,21 @@ append_if_symbol "$FRAG" NET_ACT_MIRRED y
 append_if_symbol "$FRAG" NET_ACT_POLICE y
 
 # iptables/nftables helpers used by transparent proxying and routing rules.
+# QCOM's strict check_merged_defconfig rejects fragment entries whose Kconfig
+# dependencies do not stick. NFT_NAT in particular requires NF_CONNTRACK and
+# NF_TABLES_IPV4 or NF_TABLES_IPV6. Keep the nftables core built-in and leaf
+# expressions as modules so nft NAT/redirect/tproxy can resolve cleanly without
+# losing the classic xtables path used by existing Kurumi routing.
+append_if_symbol "$FRAG" NETFILTER_ADVANCED y
+append_if_symbol "$FRAG" NETFILTER_XTABLES y
+append_if_symbol "$FRAG" NF_CONNTRACK y
+append_if_symbol "$FRAG" NF_CONNTRACK_MARK y
+append_if_symbol "$FRAG" NF_NAT y
+append_if_symbol "$FRAG" NF_TABLES y
+append_if_symbol "$FRAG" NF_TABLES_INET y
+append_if_symbol "$FRAG" NF_TABLES_IPV4 y
+append_if_symbol "$FRAG" NF_TABLES_IPV6 y
+
 append_if_symbol "$FRAG" NETFILTER_XT_TARGET_TPROXY y
 append_if_symbol "$FRAG" NETFILTER_XT_MATCH_SOCKET y
 append_if_symbol "$FRAG" NETFILTER_XT_MATCH_OWNER y
@@ -168,13 +184,12 @@ append_if_symbol "$FRAG" NETFILTER_XT_TARGET_REDIRECT y
 append_if_symbol "$FRAG" NETFILTER_XT_TARGET_MASQUERADE y
 append_if_symbol "$FRAG" NETFILTER_XT_MATCH_MULTIPORT y
 append_if_symbol "$FRAG" NETFILTER_XT_MATCH_COMMENT y
-append_if_symbol "$FRAG" NF_TABLES m
 append_if_symbol "$FRAG" NFT_TPROXY m
 append_if_symbol "$FRAG" NFT_SOCKET m
+append_if_symbol "$FRAG" NFT_CT m
 append_if_symbol "$FRAG" NFT_NAT m
 append_if_symbol "$FRAG" NFT_MASQ m
 append_if_symbol "$FRAG" NFT_REDIR m
-append_if_symbol "$FRAG" NFT_CT m
 
 # Diagnostics / tcpdump / ss / conntrack-friendly visibility.
 append_if_symbol "$FRAG" PACKET y

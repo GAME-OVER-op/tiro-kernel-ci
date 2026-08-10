@@ -72,7 +72,6 @@ MODULES = [
     # Kurumi Network Pack: optional network lab / nftables / traffic-control modules.
     "drivers/net/ipvlan/ipvlan.ko",
     "drivers/net/macvlan.ko",
-    "net/netfilter/nf_tables.ko",
     "net/netfilter/nft_chain_nat.ko",
     "net/netfilter/nft_ct.ko",
     "net/netfilter/nft_masq.ko",

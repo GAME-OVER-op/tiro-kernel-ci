@@ -44,7 +44,6 @@ MODULES=(
   "drivers/net/ipvlan/ipvlan.ko"
   "net/sched/sch_cake.ko"
   "net/sched/cls_flower.ko"
-  "net/netfilter/nf_tables.ko"
   "net/netfilter/nft_ct.ko"
   "net/netfilter/nft_nat.ko"
   "net/netfilter/nft_chain_nat.ko"

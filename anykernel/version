@@ -7,7 +7,7 @@ Highlights:
  - Battery tweak baked into the kernel via overlay.d
    (WALT freq smoothing + fewer VM wakeups; run by Magisk on boot)
  - Stock KMI / ABI parity (no LOCALVERSION ABI break)
- - Kurumi Network Pack: external USB Wi-Fi + USB Ethernet modules
+ - Kurumi Network Pack v23: external USB Wi-Fi + USB Ethernet modules
 
 Flashing: RAM-boot test first (fastboot boot boot.img), then flash this zip.
 Revert battery tweak: reflash stock init_boot.
