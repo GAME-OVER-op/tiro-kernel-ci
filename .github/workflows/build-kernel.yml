@@ -415,6 +415,8 @@ jobs:
           } >> "$FRAG"
           echo '--- Kurumi: integrate safe autonomy config into actual common GKI Image ---'
           bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_power_config.sh" "$PWD"
+          echo '--- Kurumi: integrate Network Pack config (USB Wi-Fi + network tooling) ---'
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_network_pack.sh" "$PWD"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
           #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
           #   defconfig, to stay clear of the savedefconfig gate. Author identity also shows via
@@ -603,6 +605,24 @@ jobs:
             fi
           done
           echo "OK: release/autonomy config checks passed."
+          echo '--- Kurumi Network Pack config check ---'
+          for sym in \
+            CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_ATH9K_HTC CONFIG_CARL9170 \
+            CONFIG_RT73USB CONFIG_RT2800USB CONFIG_RTL8187 CONFIG_RTL8XXXU \
+            CONFIG_MT7601U CONFIG_MT76x0U CONFIG_MT76x2U CONFIG_MT7663U CONFIG_MT7921U \
+            CONFIG_ZD1211RW CONFIG_USB_NET_CDCETHER CONFIG_USB_NET_CDC_NCM \
+            CONFIG_USB_NET_AX8817X CONFIG_USB_NET_AX88179_178A CONFIG_USB_RTL8152; do
+            grep -E "^${sym}=" <<<"$CFG" || { echo "ERROR: ${sym} missing from built config."; exit 1; }
+          done
+          echo "OK: Kurumi Network Pack config checks passed."
+
+      - name: Stash Kurumi Network Pack modules
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_collect_net_modules.sh" out "$GITHUB_WORKSPACE/net_modules"
+          echo '--- Kurumi Network Pack modules ---'
+          find "$GITHUB_WORKSPACE/net_modules" -type f | sort
 
       - name: Export final kernel config audit artifacts
         working-directory: /mnt/src/kp/kernel_platform
@@ -640,6 +660,11 @@ jobs:
             echo
             echo '--- release/debug visibility audit (not all are bad; inspect before disabling) ---'
             for sym in               CONFIG_DEBUG_KERNEL CONFIG_DEBUG_FS CONFIG_DYNAMIC_DEBUG               CONFIG_FTRACE CONFIG_FUNCTION_TRACER CONFIG_KPROBES               CONFIG_IRQSOFF_TRACER CONFIG_SCHED_DEBUG CONFIG_LOCKDEP               CONFIG_PROVE_LOCKING CONFIG_KASAN CONFIG_KCSAN CONFIG_UBSAN               CONFIG_DEBUG_PREEMPT CONFIG_DEBUG_SPINLOCK CONFIG_DEBUG_MUTEXES               CONFIG_PM_DEBUG CONFIG_PM_ADVANCED_DEBUG               CONFIG_THERMAL_STATISTICS CONFIG_THERMAL_EMULATION; do
+              grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
+            done
+            echo
+            echo '--- Kurumi Network Pack / external USB adapters ---'
+            for sym in               CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_CFG80211_WEXT               CONFIG_ATH9K_HTC CONFIG_CARL9170 CONFIG_RT73USB CONFIG_RT2800USB               CONFIG_RTL8187 CONFIG_RTL8XXXU CONFIG_MT7601U CONFIG_MT76x0U               CONFIG_MT76x2U CONFIG_MT7663U CONFIG_MT7921U CONFIG_ZD1211RW               CONFIG_USB_NET_CDCETHER CONFIG_USB_NET_CDC_NCM CONFIG_USB_NET_RNDIS_HOST               CONFIG_USB_NET_AX8817X CONFIG_USB_NET_AX88179_178A CONFIG_USB_RTL8152               CONFIG_USB_NET_SMSC75XX CONFIG_USB_NET_SMSC95XX               CONFIG_TUN CONFIG_VETH CONFIG_BRIDGE CONFIG_IFB CONFIG_VLAN_8021Q               CONFIG_WIREGUARD CONFIG_NETFILTER_XT_TARGET_TPROXY CONFIG_NF_TABLES; do
               grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
             done
             echo
@@ -831,6 +856,20 @@ jobs:
           [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
           [ -f "$AK/files/dtb/kurumi_gpu.dtb" ] || { echo 'ERROR: files/dtb/kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
           [ -f "$AK/files/dtb/stock_gpu.dtb" ] || { echo 'ERROR: files/dtb/stock_gpu.dtb (stock GPU dtb for revert) missing'; exit 1; }
+          # Bundle freshly built Kurumi Network Pack modules. They are installed as a
+          # small Magisk/KSU module so USB Wi-Fi/USB-LAN drivers are available on-device
+          # even though the flashable zip only replaces the boot kernel Image.
+          rm -rf "$AK/files/net_modules"
+          if [ -d "$GITHUB_WORKSPACE/net_modules/lib/modules" ]; then
+            mkdir -p "$AK/files"
+            cp -rf "$GITHUB_WORKSPACE/net_modules" "$AK/files/net_modules"
+            echo 'bundled Kurumi Network Pack modules:'
+            find "$AK/files/net_modules" -type f | sort
+          else
+            echo 'ERROR: Kurumi Network Pack modules were not stashed; cannot provide USB Wi-Fi support.'
+            exit 1
+          fi
+
           # Drop the freshly built kernels in, replacing any stale images.
           # Ship variants under names AnyKernel will NOT auto-detect; the flash-time menu copies
           # the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a bare

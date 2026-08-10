@@ -1,0 +1,6 @@
+id=kurumi_network
+name=Kurumi Network Pack
+version=v1
+versionCode=1
+author=GAME-OVER-op / Kurumi
+description=External USB Wi-Fi and USB network adapter kernel modules for Kurumi kernel.
