@@ -41,19 +41,41 @@ on GKI) and imported by Magisk, which runs `kurumi_battery` on boot:
   - `eco` / `balance`: delayed push. Wi-Fi stays ON, Android background scan/perf knobs are disabled, and only the direct WLAN endpoint `power/wakeup` is disabled. The PCIe parent chain is not touched.
   - `full`: soft push. Wi-Fi stays ON, Android background scan/perf knobs are disabled, and direct WLAN wakeup is kept/enabled so push notifications are close to stock.
 
-The Rust daemon is launched by `init.kurumi.rc` on `sys.boot_completed=1`, then
-waits 90 seconds before applying the one-time profile. There is no screen polling
-and no periodic Wi-Fi loop. Only `/sys` + `/proc` + Android shell settings are
-written - reversible, no partition writes, no log file. Requires Magisk (root).
-Revert: reflash stock `init_boot` or choose `Skip` in the installer profile menu.
+The Rust daemon is launched either through Magisk `overlay.d` or, on pure
+KernelSU/KSU+SuSFS installs without Magisk, through
+`/data/adb/modules/kurumi_kernel/service.sh`. It waits 90 seconds after
+`boot_completed` before applying the selected profile. Only `/sys` + `/proc` +
+Android shell settings are written - reversible, no partition writes, no log
+file. Choosing `Skip` removes the Kurumi runtime path.
+
+Screen-off autonomy is kernel-assisted: when the built Image contains
+`CONFIG_KURUMI_SCREEN_STATE=y`, the kernel exposes a tiny read-only bridge at
+`/sys/kernel/kurumi_screen/`:
+
+```text
+state     # on / off / unknown
+seq       # increments when state changes
+since_ms  # milliseconds since last change
+poll_ms   # recommended daemon poll delay: 30s off, 60s on/unknown
+```
+
+The daemon reads only this cheap sysfs state. It does not call `dumpsys`,
+`cmd power` or Binder-based Android APIs to detect the screen. After the screen
+stays off for 30 seconds it temporarily applies an Eco-like CPU/UFS fallback;
+when the screen turns on it restores the selected flash-time profile. Touch boost
+is also suppressed while the kernel reports the screen as off.
 
 
-## Kernel-only daily-use changes
-The kernel workflow also applies a small kernel-only daily-use layer:
+## Kernel-only daily-use / autonomy changes
+The kernel workflow applies the autonomy layer to the **actual common GKI Image**, not only to the vendor fragment:
 
-- `CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y` for lower idle/workqueue overhead where supported.
-- `CONFIG_LRU_GEN=y` and `CONFIG_LRU_GEN_ENABLED=y` are requested so MGLRU is enabled by default when supported by the final GKI config.
-- A `kurumi-kernel-config-audit` artifact is uploaded from the built Image, including `final.config`, `kernel.release`, optional `Module.symvers`, and a release/debug audit for MGLRU, PSI, uclamp, EAS, cpuidle, workqueue and heavy debug symbols.
+- `CONFIG_KURUMI_SCREEN_STATE=y` adds the minimal `/sys/kernel/kurumi_screen` bridge used by the daemon.
+- `CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y` is requested in `common/arch/arm64/configs/gki_defconfig` so kernel workqueues prefer lower-power execution by default.
+- `CONFIG_LRU_GEN=y` and `CONFIG_LRU_GEN_ENABLED=y` are requested in the common GKI config so MGLRU is enabled by default.
+- `CONFIG_RCU_LAZY=y` is requested when the branch exposes it, and `CONFIG_RCU_LAZY_DEFAULT_OFF=y` is removed so lazy RCU callbacks are not built but disabled by default.
+- Release-heavy options are removed from the built Image path: `CONFIG_UBSAN`, `CONFIG_PM_DEBUG`, `CONFIG_PM_ADVANCED_DEBUG`, `CONFIG_THERMAL_STATISTICS`, and `CONFIG_THERMAL_EMULATION`. `CONFIG_KASAN` stays enabled because this QCOM GKI KMI expects its symbols.
+- CI extracts the final config from the built Image and fails the build if the screen bridge, workqueue power mode, MGLRU, IPv6 NAT, or release-debug cleanup did not actually land.
+- A `kurumi-kernel-config-audit` artifact is uploaded from the built Image, including `final.config`, `kernel.release`, optional `Module.symvers`, and a release/debug audit for MGLRU, RCU lazy, PSI, uclamp, EAS, cpuidle, workqueue and heavy debug symbols.
 - SuSFS variant integration uses plain `KernelSU-Next legacy` plus the matching `susfs4ksu` KSU-side patch instead of mismatched pre-integrated susfs tags.
 
 ## Build identity
@@ -74,7 +96,3 @@ Only after it is proven stable, flash `Kurumi_kernel_build<N>.zip` in recovery.
 
 ## License
 MIT (see `anykernel/LICENSE`).
-
-## Kurumi Power Monitor
-
-The Rust daemon includes a low-rate consumption recorder. It stores history under `/data/adb/kurumi_monitor/`, creates a separate boot session for each `/proc/sys/kernel/random/boot_id`, takes one baseline after boot and then one snapshot per hour. Reports are raw TSV tables without verdicts. See `docs/KURUMI_POWER_MONITOR.md`.
