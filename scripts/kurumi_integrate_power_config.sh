@@ -29,6 +29,48 @@ drop_symbol_lines() {
   done
 }
 
+# common/arch/arm64/configs/gki_defconfig is checked by Kleaf through
+# savedefconfig. Appending options at the bottom makes savedefconfig move them
+# back into canonical order and the build aborts with:
+#   ERROR: savedefconfig does not match .../gki_defconfig
+# So every common GKI option must be inserted near the place where
+# savedefconfig would put it.
+insert_symbol_y_before() {
+  local file="$1"
+  local sym="$2"
+  local anchor="$3"
+  drop_symbol_lines "$file" "$sym"
+  if grep -qE "$anchor" "$file"; then
+    awk -v line="CONFIG_${sym}=y" -v anchor="$anchor" '
+      $0 ~ anchor && !done { print line; done=1 }
+      { print }
+      END { if (!done) print line }
+    ' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+  else
+    echo "ERROR: cannot place CONFIG_${sym}=y in savedefconfig order; anchor not found: $anchor" >&2
+    exit 1
+  fi
+}
+
+insert_symbol_y_after() {
+  local file="$1"
+  local sym="$2"
+  local anchor="$3"
+  drop_symbol_lines "$file" "$sym"
+  if grep -qE "$anchor" "$file"; then
+    awk -v line="CONFIG_${sym}=y" -v anchor="$anchor" '
+      { print }
+      $0 ~ anchor && !done { print line; done=1 }
+      END { if (!done) print line }
+    ' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+  else
+    echo "ERROR: cannot place CONFIG_${sym}=y in savedefconfig order; anchor not found: $anchor" >&2
+    exit 1
+  fi
+}
+
 set_symbol_y() {
   local file="$1"
   local sym="$2"
@@ -52,7 +94,11 @@ set_symbol_notset_or_drop() {
 
 # Actual flashed Image is built from common/. Keep this strict and conservative.
 # KASAN is intentionally NOT disabled: QCOM GKI KMI expects kasan_flag_enabled.
+# Remove stale appended Kurumi comments/blocks from older workflow runs before
+# re-inserting symbols in savedefconfig-compatible order.
 sed -i \
+  -e '/^# Kurumi: cheap kernel screen state for userspace profile daemon$/d' \
+  -e '/^# === Kurumi: safe autonomy additions, final Image is verified after build ===$/d' \
   -e '/^CONFIG_MODULE_SIG_PROTECT=y/d' \
   -e '/^CONFIG_PM_DEBUG=y/d' \
   -e '/^CONFIG_PM_ADVANCED_DEBUG=y/d' \
@@ -76,15 +122,15 @@ sed -i -e '/^CONFIG_UBSAN_/d' -e '/^# CONFIG_UBSAN_.* is not set$/d' "$MDEF"
 
 # Autonomy symbols that are safe and should land in the real common GKI Image.
 if has_kconfig_symbol WQ_POWER_EFFICIENT_DEFAULT; then
-  set_symbol_y "$CDEF" WQ_POWER_EFFICIENT_DEFAULT
+  insert_symbol_y_before "$CDEF" WQ_POWER_EFFICIENT_DEFAULT '^CONFIG_ENERGY_MODEL=y$'
 else
   echo 'WARN: CONFIG_WQ_POWER_EFFICIENT_DEFAULT not present in this common tree'
 fi
 
 if has_kconfig_symbol LRU_GEN; then
-  set_symbol_y "$CDEF" LRU_GEN
+  insert_symbol_y_before "$CDEF" LRU_GEN '^CONFIG_DAMON=y$'
   if has_kconfig_symbol LRU_GEN_ENABLED; then
-    set_symbol_y "$CDEF" LRU_GEN_ENABLED
+    insert_symbol_y_before "$CDEF" LRU_GEN_ENABLED '^CONFIG_DAMON=y$'
   fi
 else
   echo 'WARN: CONFIG_LRU_GEN not present in this common tree'
@@ -95,10 +141,16 @@ fi
 # savedefconfig-style checks may omit default-n lines. Removing DEFAULT_OFF is
 # enough when RCU_LAZY is enabled.
 if has_kconfig_symbol RCU_LAZY; then
-  set_symbol_y "$CDEF" RCU_LAZY
+  insert_symbol_y_after "$CDEF" RCU_LAZY '^CONFIG_RCU_NOCB_CPU=y$'
   drop_symbol_lines "$CDEF" RCU_LAZY_DEFAULT_OFF
 else
   echo 'WARN: CONFIG_RCU_LAZY not present in this common tree'
+fi
+
+# The screen sysfs bridge also lives in common/. If an earlier integration step
+# appended it at the bottom, move it to the canonical misc-driver area.
+if has_kconfig_symbol KURUMI_SCREEN_STATE; then
+  insert_symbol_y_before "$CDEF" KURUMI_SCREEN_STATE '^CONFIG_SCSI=y$'
 fi
 
 # Keep the vendor fragment additive for compatibility with existing workflow.
