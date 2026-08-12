@@ -67,7 +67,6 @@ MODULES = [
     "drivers/net/wireless/realtek/rtl818x/rtl8187/rtl8187.ko",
     "drivers/net/wireless/realtek/rtl8xxxu/rtl8xxxu.ko",
     "drivers/net/wireless/zydas/zd1211rw/zd1211rw.ko",
-    "lib/crc-ccitt.ko",
 
     # Kurumi Network Pack: optional network lab / nftables / traffic-control modules.
     "drivers/net/ipvlan/ipvlan.ko",

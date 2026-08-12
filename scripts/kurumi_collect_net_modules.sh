@@ -14,7 +14,6 @@ MODULES=(
   "net/rfkill/rfkill.ko"
   "lib/crypto/libarc4.ko"
   "lib/crc-itu-t.ko"
-  "lib/crc-ccitt.ko"
   "drivers/misc/eeprom/eeprom_93cx6.ko"
   "net/wireless/cfg80211.ko"
   "net/mac80211/mac80211.ko"
