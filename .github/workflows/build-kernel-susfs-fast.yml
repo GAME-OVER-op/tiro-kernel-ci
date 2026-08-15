@@ -381,8 +381,6 @@ jobs:
           } >> "$FRAG"
           echo '--- Kurumi: integrate safe autonomy config into actual common GKI Image ---'
           bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_power_config.sh" "$PWD"
-          echo '--- Kurumi: integrate Network Pack config (USB Wi-Fi + network tooling) ---'
-          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_network_pack.sh" "$PWD"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
           #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
           #   defconfig, to stay clear of the savedefconfig gate. Author identity also shows via

@@ -66,32 +66,6 @@ when the screen turns on it restores the selected flash-time profile. Touch boos
 is also suppressed while the kernel reports the screen as off.
 
 
-
-## Kurumi Network Pack
-
-The kernel workflow also enables and bundles a network-oriented module pack for
-external USB adapters and Kali/chroot networking work. The flashable zip installs
-these modules as a separate `/data/adb/modules/kurumi_network` Magisk/KSU module
-when `/data/adb/modules` is available.
-
-Included support:
-
-- External USB Wi-Fi dongles from the in-tree Linux 6.1 drivers: `ath9k_htc`,
-  `carl9170`, `rt2800usb`, `rt73usb`, `rtl8187`, `rtl8xxxu`, `mt7601u`,
-  `mt76x0u`, `mt76x2u`, `mt7663u`, `mt7921u`, and `zd1211rw`.
-- USB Ethernet / modem-style networking: CDC Ethernet, CDC NCM, RNDIS host,
-  ASIX, AX88179/178A, RTL8152/8153, SMSC75xx/95xx, CDC MBIM and QMI WWAN where
-  the branch exposes the symbols.
-- Network lab primitives: TUN, VETH, bridge, IFB, VLAN, WireGuard, classic
-  TPROXY/mark/owner/socket iptables helpers, selected nftables modules, packet
-  diagnostics and traffic-control helpers.
-
-Firmware blobs are not bundled. If a USB Wi-Fi adapter requires firmware, place
-it in a firmware path visible to Android or provide it with a separate
-Magisk/KSU firmware module. Out-of-tree Realtek `88xxau/88x2bu` drivers are not
-vendored in this clean-tree pack; only drivers already present in the kernel tree
-are enabled.
-
 ## Kernel-only daily-use / autonomy changes
 The kernel workflow applies the autonomy layer to the **actual common GKI Image**, not only to the vendor fragment:
 

@@ -52,32 +52,6 @@ kurumi_data_modules_ready() {
   return 0;
 }
 
-KURUMI_NETWORK_MODULE_DIR=/data/adb/modules/kurumi_network
-
-kurumi_install_network_module() {
-  [ -d "$home/files/net_modules/lib/modules" ] || { ui_print " " "Kurumi: network modules not bundled - skipping network module"; return 0; };
-  [ -f "$home/files/net_modules/modules.load" ] || { ui_print " " "Kurumi: modules.load missing - skipping network module"; return 0; };
-  [ -f "$home/files/network_module/module.prop" ] || { ui_print " " "WARNING: kurumi_network module.prop missing"; return 1; };
-  [ -f "$home/files/network_module/service.sh" ] || { ui_print " " "WARNING: kurumi_network service.sh missing"; return 1; };
-  if ! kurumi_data_modules_ready; then
-    ui_print " " "WARNING: /data/adb/modules is not writable - Kurumi Network Pack skipped";
-    return 1;
-  fi;
-  ui_print " " "Kurumi: installing Network Pack module";
-  rm -rf "$KURUMI_NETWORK_MODULE_DIR" 2>/dev/null;
-  mkdir -p "$KURUMI_NETWORK_MODULE_DIR/lib/modules" || { ui_print " " "WARNING: cannot create $KURUMI_NETWORK_MODULE_DIR"; return 1; };
-  cp -f "$home/files/network_module/module.prop" "$KURUMI_NETWORK_MODULE_DIR/module.prop" || return 1;
-  cp -f "$home/files/network_module/service.sh" "$KURUMI_NETWORK_MODULE_DIR/service.sh" || return 1;
-  cp -f "$home/files/net_modules/modules.load" "$KURUMI_NETWORK_MODULE_DIR/modules.load" || return 1;
-  cp -f "$home/files/net_modules/lib/modules/"*.ko "$KURUMI_NETWORK_MODULE_DIR/lib/modules/" || return 1;
-  [ -f "$home/files/net_modules/README.txt" ] && cp -f "$home/files/net_modules/README.txt" "$KURUMI_NETWORK_MODULE_DIR/README.txt" 2>/dev/null || true;
-  chown -R 0:0 "$KURUMI_NETWORK_MODULE_DIR" 2>/dev/null;
-  chmod 0755 "$KURUMI_NETWORK_MODULE_DIR" "$KURUMI_NETWORK_MODULE_DIR/service.sh" "$KURUMI_NETWORK_MODULE_DIR/lib" "$KURUMI_NETWORK_MODULE_DIR/lib/modules" 2>/dev/null;
-  chmod 0644 "$KURUMI_NETWORK_MODULE_DIR/module.prop" "$KURUMI_NETWORK_MODULE_DIR/modules.load" "$KURUMI_NETWORK_MODULE_DIR/lib/modules/"*.ko 2>/dev/null;
-  chcon -R u:object_r:adb_data_file:s0 "$KURUMI_NETWORK_MODULE_DIR" 2>/dev/null || /system/bin/chcon -R u:object_r:adb_data_file:s0 "$KURUMI_NETWORK_MODULE_DIR" 2>/dev/null || true;
-  ui_print " " "Kurumi: Network Pack installed to $KURUMI_NETWORK_MODULE_DIR";
-}
-
 kurumi_install_data_module() {
   local srcbin;
   [ "$KPROFILE" = "skip" ] && { kurumi_remove_data_module; return 0; };
@@ -214,9 +188,6 @@ if [ -d "$home/ramdisk/overlay.d" ]; then
   rm -rf "$home/ramdisk/overlay.d";
   rmdir "$home/ramdisk" 2>/dev/null || true;
 fi;
-
-# Network Pack is independent from the profile daemon: install it whenever /data/adb/modules is available.
-kurumi_install_network_module;
 
 # If the user selects stock or explicit Skip, clear stale KSU module early.
 # This prevents a previous KSU/SuSFS install from resurrecting the daemon later.

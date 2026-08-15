@@ -65,29 +65,9 @@ if 'KURUMI_SCREEN_HOOK_UPDATE_STATUS' not in s:
 p.write_text(s)
 PY_BL
 
-# Keep common gki_defconfig savedefconfig-compatible: insert the symbol near
-# the misc driver block instead of appending it at the bottom.
-python3 - "$CDEF" <<'PY_CDEF'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-lines = p.read_text().splitlines()
-filtered = []
-for line in lines:
-    if line == '# Kurumi: cheap kernel screen state for userspace profile daemon':
-        continue
-    if line.startswith('CONFIG_KURUMI_SCREEN_STATE='):
-        continue
-    if line == '# CONFIG_KURUMI_SCREEN_STATE is not set':
-        continue
-    filtered.append(line)
-try:
-    insert_at = filtered.index('CONFIG_SCSI=y')
-except ValueError:
-    insert_at = len(filtered)
-filtered.insert(insert_at, 'CONFIG_KURUMI_SCREEN_STATE=y')
-p.write_text('\n'.join(filtered) + '\n')
-PY_CDEF
+if ! grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' "$CDEF"; then
+  printf '\n# Kurumi: cheap kernel screen state for userspace profile daemon\nCONFIG_KURUMI_SCREEN_STATE=y\n' >> "$CDEF"
+fi
 
 grep -q 'kurumi_screen_state_from_backlight' "$BL" || { echo 'ERROR: backlight hook missing' >&2; exit 1; }
 grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' "$CDEF" || { echo 'ERROR: CONFIG_KURUMI_SCREEN_STATE not enabled' >&2; exit 1; }
