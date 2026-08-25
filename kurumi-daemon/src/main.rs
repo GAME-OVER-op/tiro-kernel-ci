@@ -31,8 +31,6 @@
 //   Periodic:
 //     - WALT + VM tunables: burst every 60s for the first 20 min (WALT governor
 //       comes up late), then re-assert every 3h (idempotent).
-//     - thermal settings + cpufreq floor re-check every 10h (idempotent;
-//       silently re-applies if something restored them).
 // =====================================================================
 
 use std::fs::{self, File};
@@ -67,7 +65,6 @@ const BURST_WINDOW_SECS: u64 = 20 * 60;
 const BURST_INTERVAL_SECS: u64 = 60;
 const STEADY_TICK_SECS: u64 = 3600;
 const WALT_STEADY_SECS: u64 = 3 * 3600;
-const THERMAL_RECHECK_SECS: u64 = 10 * 3600;
 
 // ---- Kurumi kernel screen-state bridge ----
 const KURUMI_SCREEN_STATE: &str = "/sys/kernel/kurumi_screen/state";
@@ -112,7 +109,7 @@ fn write_val<P: AsRef<Path>>(path: P, val: &str) -> bool {
 }
 
 // Idempotent: only writes when the current value differs (avoids needless churn
-// on the 3h/10h re-checks).
+// on periodic 3h WALT/VM re-assertions and profile restores).
 fn write_if_diff<P: AsRef<Path>>(path: P, val: &str) -> bool {
     let p = path.as_ref();
     if !p.exists() {
@@ -758,25 +755,15 @@ fn main() {
         thread::sleep(Duration::from_secs(BURST_INTERVAL_SECS));
     }
 
-    // Steady state: hourly tick. WALT/VM every 3h, thermal re-check every 10h.
+    // Steady state: hourly tick. Only WALT/VM is re-asserted every 3h.
+    // Thermal disabling is intentionally one-shot at boot after BOOT_WAIT_SECS.
     let mut walt_acc: u64 = 0;
-    let mut therm_acc: u64 = 0;
     loop {
         thread::sleep(Duration::from_secs(STEADY_TICK_SECS));
         walt_acc += STEADY_TICK_SECS;
-        therm_acc += STEADY_TICK_SECS;
         if walt_acc >= WALT_STEADY_SECS {
             apply_walt_vm();
             walt_acc = 0;
-        }
-        if therm_acc >= THERMAL_RECHECK_SECS {
-            disable_thermal_services();
-            if screen_active.load(Ordering::Relaxed) {
-                apply_cpufreq_limits();
-            } else {
-                apply_screen_off_fallback();
-            }
-            therm_acc = 0;
         }
     }
 }
