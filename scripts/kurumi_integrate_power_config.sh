@@ -29,11 +29,36 @@ drop_symbol_lines() {
   done
 }
 
-set_symbol_y() {
+insert_symbol_y_after() {
   local file="$1"
   local sym="$2"
+  local anchor="$3"
+
+  # Kleaf's common GKI KernelConfig runs `savedefconfig` and requires the
+  # checked-in gki_defconfig to already be in canonical Kconfig order.  Do not
+  # append new common-GKI symbols to EOF: savedefconfig moves them and the
+  # byte-for-byte check fails.
   drop_symbol_lines "$file" "$sym"
-  printf 'CONFIG_%s=y\n' "$sym" >> "$file"
+
+  if ! grep -qF "$anchor" "$file"; then
+    echo "ERROR: canonical insertion anchor for CONFIG_${sym} not found: ${anchor}" >&2
+    exit 1
+  fi
+
+  python3 - "$file" "$anchor" "CONFIG_${sym}=y" <<'PY_INSERT'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+anchor = sys.argv[2]
+line = sys.argv[3]
+text = path.read_text()
+needle = anchor + "\n"
+if needle not in text:
+    raise SystemExit(f"ERROR: insertion anchor disappeared: {anchor}")
+text = text.replace(needle, needle + line + "\n", 1)
+path.write_text(text)
+PY_INSERT
 }
 
 set_symbol_notset_or_drop() {
@@ -76,15 +101,16 @@ sed -i -e '/^CONFIG_UBSAN_/d' -e '/^# CONFIG_UBSAN_.* is not set$/d' "$MDEF"
 
 # Autonomy symbols that are safe and should land in the real common GKI Image.
 if has_kconfig_symbol WQ_POWER_EFFICIENT_DEFAULT; then
-  set_symbol_y "$CDEF" WQ_POWER_EFFICIENT_DEFAULT
+  insert_symbol_y_after "$CDEF" WQ_POWER_EFFICIENT_DEFAULT '# CONFIG_PM_WAKELOCKS_GC is not set'
 else
   echo 'WARN: CONFIG_WQ_POWER_EFFICIENT_DEFAULT not present in this common tree'
 fi
 
 if has_kconfig_symbol LRU_GEN; then
-  set_symbol_y "$CDEF" LRU_GEN
+  insert_symbol_y_after "$CDEF" LRU_GEN 'CONFIG_USERFAULTFD=y'
   if has_kconfig_symbol LRU_GEN_ENABLED; then
-    set_symbol_y "$CDEF" LRU_GEN_ENABLED
+    # Insert after LRU_GEN so the pair matches savedefconfig's canonical order.
+    insert_symbol_y_after "$CDEF" LRU_GEN_ENABLED 'CONFIG_LRU_GEN=y'
   fi
 else
   echo 'WARN: CONFIG_LRU_GEN not present in this common tree'
@@ -95,7 +121,7 @@ fi
 # savedefconfig-style checks may omit default-n lines. Removing DEFAULT_OFF is
 # enough when RCU_LAZY is enabled.
 if has_kconfig_symbol RCU_LAZY; then
-  set_symbol_y "$CDEF" RCU_LAZY
+  insert_symbol_y_after "$CDEF" RCU_LAZY 'CONFIG_RCU_NOCB_CPU=y'
   drop_symbol_lines "$CDEF" RCU_LAZY_DEFAULT_OFF
 else
   echo 'WARN: CONFIG_RCU_LAZY not present in this common tree'
@@ -104,6 +130,15 @@ fi
 # Keep the vendor fragment additive for compatibility with existing workflow.
 # Duplicates are removed first so repeated runs stay stable.
 drop_symbol_lines "$FRAG" WQ_POWER_EFFICIENT_DEFAULT LRU_GEN LRU_GEN_ENABLED RCU_LAZY RCU_LAZY_DEFAULT_OFF
+sed -i '/^# === Kurumi: safe autonomy additions, final Image is verified after build ===$/d' "$FRAG"
+# Normalize trailing blank lines so rerunning the helper is byte-for-byte stable.
+python3 - "$FRAG" <<'PY_FRAG_CLEAN'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text().rstrip() + "\n"
+p.write_text(s)
+PY_FRAG_CLEAN
 {
   echo ''
   echo '# === Kurumi: safe autonomy additions, final Image is verified after build ==='

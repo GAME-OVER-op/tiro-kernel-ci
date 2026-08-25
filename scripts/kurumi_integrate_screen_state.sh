@@ -65,9 +65,31 @@ if 'KURUMI_SCREEN_HOOK_UPDATE_STATUS' not in s:
 p.write_text(s)
 PY_BL
 
-if ! grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' "$CDEF"; then
-  printf '\n# Kurumi: cheap kernel screen state for userspace profile daemon\nCONFIG_KURUMI_SCREEN_STATE=y\n' >> "$CDEF"
+# Keep common/arch/arm64/configs/gki_defconfig in savedefconfig order.  Kleaf
+# compares the generated defconfig against this file exactly; appending this
+# symbol (or a custom comment) at EOF makes the strict KernelConfig gate fail.
+sed -i \
+  -e '/^CONFIG_KURUMI_SCREEN_STATE=.*/d' \
+  -e '/^# CONFIG_KURUMI_SCREEN_STATE is not set$/d' \
+  -e '/^# Kurumi: cheap kernel screen state for userspace profile daemon$/d' \
+  "$CDEF"
+
+if ! grep -q '^CONFIG_UID_SYS_STATS=y' "$CDEF"; then
+  echo 'ERROR: canonical insertion anchor CONFIG_UID_SYS_STATS=y not found in common gki_defconfig' >&2
+  exit 1
 fi
+python3 - "$CDEF" <<'PY_DEFCONFIG'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+anchor = 'CONFIG_UID_SYS_STATS=y\n'
+if anchor not in s:
+    raise SystemExit('ERROR: CONFIG_UID_SYS_STATS=y insertion anchor disappeared')
+s = s.replace(anchor, anchor + 'CONFIG_KURUMI_SCREEN_STATE=y\n', 1)
+p.write_text(s)
+PY_DEFCONFIG
 
 grep -q 'kurumi_screen_state_from_backlight' "$BL" || { echo 'ERROR: backlight hook missing' >&2; exit 1; }
 grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' "$CDEF" || { echo 'ERROR: CONFIG_KURUMI_SCREEN_STATE not enabled' >&2; exit 1; }

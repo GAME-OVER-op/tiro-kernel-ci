@@ -361,24 +361,10 @@ jobs:
             -e 's/^CONFIG_MODULE_SIG_PROTECT=y/# CONFIG_MODULE_SIG_PROTECT is not set/' \
             "$DEF"
 
-          # Additive-only tweaks in the vendor fragment (enabling new symbols is allowed).
-          # NOTE: BBR/TCP-default was intentionally dropped: GKI ships with
-          # CONFIG_TCP_CONG_ADVANCED off, so the congestion choice is hidden and
-          # TCP_CONG_BBR/DEFAULT_BBR cannot stick (gate (2) rejects them). BBR would
-          # require re-opening the choice, which perturbs many symbols. Not worth it
-          # for a balanced-power build; CUBIC default is fine.
-          {
-            echo ''
-            echo '# === custom: balanced daily-use/power config (additive, verified by post-build audit) ==='
-            echo 'CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y'
-            # MGLRU improves page reclaim behaviour under memory pressure. It is
-            # especially useful for Android daily use (many cached apps + zRAM). If
-            # the symbol is already enabled in the base, this is harmless; if a future
-            # tree cannot enable it, the post-build config audit will warn instead of
-            # silently assuming it landed.
-            echo 'CONFIG_LRU_GEN=y'
-            echo 'CONFIG_LRU_GEN_ENABLED=y'
-          } >> "$FRAG"
+          # Additive vendor-fragment power symbols and canonical common-GKI
+          # placement are handled together by kurumi_integrate_power_config.sh.
+          # Keeping this in one helper avoids duplicate fragment entries and keeps
+          # common/arch/arm64/configs/gki_defconfig compatible with savedefconfig.
           echo '--- Kurumi: integrate safe autonomy config into actual common GKI Image ---'
           bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_power_config.sh" "$PWD"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
@@ -399,14 +385,13 @@ jobs:
           # This edits a defconfig (CONFIG, not kernel source); common/ is a fresh
           # clone, so no user source tree is touched.
           #
-          # IMPORTANT: do NOT try to canonicalize via a standalone `make gki_defconfig
-          # savedefconfig` here. A bare make outside the Kleaf/android fragment context
-          # cannot resolve ~6 symbols and silently shrinks the defconfig (observed
-          # 671 -> 665). The real dist build does NOT enforce a byte-match check_defconfig
-          # on common (it already ships a non-canonical gki_defconfig and builds fine),
-          # so we just enable the symbol IN PLACE and let the real build's olddefconfig
-          # pick it up. The post-build 'Verify' step asserts it actually landed in the
-          # Image, which is the real proof.
+          # IMPORTANT: do NOT canonicalize with a standalone `make gki_defconfig
+          # savedefconfig` here. Outside Kleaf/android's full fragment context that can
+          # resolve symbols differently and shrink the defconfig. The hermetic Kleaf
+          # KernelConfig DOES enforce the savedefconfig match, so every common-GKI
+          # symbol we add must be inserted directly in its canonical Kconfig position.
+          # The post-build Verify step additionally proves that the symbol landed in
+          # the final Image.
           # ===================================================================
           if grep -q '^CONFIG_IP6_NF_NAT=y' "$CDEF"; then
             echo 'IP6_NF_NAT already enabled in common gki_defconfig'
