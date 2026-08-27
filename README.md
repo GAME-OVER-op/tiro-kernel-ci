@@ -96,3 +96,9 @@ Only after it is proven stable, flash `Kurumi_kernel_build<N>.zip` in recovery.
 
 ## License
 MIT (see `anykernel/LICENSE`).
+
+## Tiro vendor_boot / 1-7 compatibility note
+
+The experimental full `vendor_boot.img` installer has been removed. The flash ZIP keeps the original kernel-only flow and the existing DTB-only patch of the currently installed `vendor_boot`.
+
+After early-boot testing, `CONFIG_BLK_WBT` remains disabled because it changes `struct request` and is unsafe to mix with the ROM's existing prebuilt vendor/vendor_dlkm modules. The standalone Kleaf workflow restores the two safer config changes: `CONFIG_SCSI_SCAN_ASYNC=y` and disabling `CONFIG_PER_VMA_LOCK_STATS` while keeping per-VMA locking itself. Qualcomm WALT/UFS items 4-7 remain source-level experiments only and are not delivered by replacing `vendor_boot`.

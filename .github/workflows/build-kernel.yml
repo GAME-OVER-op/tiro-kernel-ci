@@ -7,8 +7,9 @@ name: Build tiro KERNEL (NX769J) - standalone Kleaf
 # `common` is then replaced with the AOSP GKI and overlaid with the nubia msm-kernel + device-trees.
 # Rationale: a standard android14-6.1 GKI Image is KMI-compatible with the device's stock vendor
 # modules (the GKI promise), so NO ABI-breaking symbol drops / module trims / custom LOCALVERSION are
-# needed -- those were OnePlus-base-only hacks and are what broke /data. Produces boot.img +
-# vendor_boot.img. TEST WITH `fastboot boot boot.img` (RAM), NEVER `fastboot flash boot`.
+# needed -- those were OnePlus-base-only hacks and are what broke /data. The flashable ZIP remains
+# kernel-only; a complete vendor_boot.img is never bundled or flashed. TEST WITH `fastboot boot
+# boot.img` (RAM), NEVER `fastboot flash boot`.
 
 on:
   workflow_dispatch:
@@ -198,6 +199,9 @@ jobs:
           echo '--- declare it so Kleaf does not abort with "kernel modules are built but not copied" ---'
           python3 "$GITHUB_WORKSPACE/scripts/tiro_module_outs_fix.py" msm-kernel
           grep -q 'drivers/leds/aw22xxx/zte_led.ko' msm-kernel/pineapple.bzl || { echo 'ERROR: module_outs fix failed'; exit 1; }
+          echo '--- Kurumi: backport selected Qualcomm 6.6 Pineapple optimizations into Nubia 6.1 vendor modules ---'
+          python3 "$GITHUB_WORKSPACE/scripts/kurumi_integrate_tiro_optimizations.py" msm-kernel
+          python3 "$GITHUB_WORKSPACE/scripts/kurumi_verify_tiro_optimizations.py" msm-kernel
           echo '--- NOTE: the nubia OEM defconfig fragments (oem/pineapple_diff.config + ---'
           echo '--- oem/boards/tiro_diff.config) are DELIBERATELY NOT applied here. They target the ---'
           echo '--- full vendor pineapple build (perf/consolidate) where vendor drivers are =y; the ---'
@@ -401,6 +405,8 @@ jobs:
           # common/arch/arm64/configs/gki_defconfig compatible with savedefconfig.
           echo '--- Kurumi: integrate safe autonomy config into actual common GKI Image ---'
           bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_power_config.sh" "$PWD"
+          echo '--- Kurumi/Tiro: restore safe optimization items 2 + 3 (BLK_WBT remains off) ---'
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_tiro_safe_2_3.sh" "$PWD"
           # NOTE: the kernel NAME (uname -r) is injected via the LOCALVERSION env var in the Build
           #   step (+ empty common/.scmversion to strip the scm/KMI/-dirty suffix) -- NOT via any
           #   defconfig, to stay clear of the savedefconfig gate. Author identity also shows via
@@ -572,6 +578,17 @@ jobs:
           echo "$CFG" | grep -q '^CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y' || { echo "ERROR: CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y missing from built Image."; exit 1; }
           echo "$CFG" | grep -q '^CONFIG_LRU_GEN=y' || { echo "ERROR: CONFIG_LRU_GEN=y missing from built Image."; exit 1; }
           echo "$CFG" | grep -q '^CONFIG_LRU_GEN_ENABLED=y' || { echo "ERROR: CONFIG_LRU_GEN_ENABLED=y missing from built Image."; exit 1; }
+          echo "$CFG" | grep -E '^CONFIG_BLK_WBT=|^CONFIG_SCSI_SCAN_ASYNC=|^CONFIG_PER_VMA_LOCK_STATS=' || true
+          if echo "$CFG" | grep -q '^CONFIG_BLK_WBT=y'; then
+            echo "ERROR: CONFIG_BLK_WBT=y must remain disabled on Tiro because it changes block-layer ABI."
+            exit 1
+          fi
+          echo "$CFG" | grep -q '^CONFIG_SCSI_SCAN_ASYNC=y' || { echo "ERROR: CONFIG_SCSI_SCAN_ASYNC=y missing from built Image."; exit 1; }
+          if echo "$CFG" | grep -q '^CONFIG_PER_VMA_LOCK_STATS=y'; then
+            echo "ERROR: CONFIG_PER_VMA_LOCK_STATS=y survived in built Image."
+            exit 1
+          fi
+          echo "OK: Tiro safe subset active: async SCSI + no per-VMA stats; BLK_WBT remains off."
           if echo "$CFG" | grep -q '^CONFIG_RCU_LAZY_DEFAULT_OFF=y'; then
             echo "ERROR: CONFIG_RCU_LAZY_DEFAULT_OFF=y means RCU lazy callbacks are built but default-disabled."
             exit 1
@@ -619,7 +636,8 @@ jobs:
             [ -f "$AUD/kernel.release" ] && echo "Release: $(cat "$AUD/kernel.release")"
             echo
             echo '--- daily-use / memory / scheduler / power ---'
-            for sym in               CONFIG_LRU_GEN CONFIG_LRU_GEN_ENABLED               CONFIG_PSI CONFIG_PSI_DEFAULT_DISABLED               CONFIG_UCLAMP_TASK CONFIG_UCLAMP_TASK_GROUP               CONFIG_ENERGY_MODEL CONFIG_CPU_FREQ_GOV_SCHEDUTIL               CONFIG_CPU_IDLE CONFIG_ARM_PSCI_CPUIDLE               CONFIG_WQ_POWER_EFFICIENT_DEFAULT CONFIG_RCU_LAZY CONFIG_RCU_LAZY_DEFAULT_OFF CONFIG_KURUMI_SCREEN_STATE; do
+            for sym in               CONFIG_LRU_GEN CONFIG_LRU_GEN_ENABLED               CONFIG_PSI CONFIG_PSI_DEFAULT_DISABLED               CONFIG_UCLAMP_TASK CONFIG_UCLAMP_TASK_GROUP               CONFIG_ENERGY_MODEL CONFIG_CPU_FREQ_GOV_SCHEDUTIL               CONFIG_CPU_IDLE CONFIG_ARM_PSCI_CPUIDLE               CONFIG_WQ_POWER_EFFICIENT_DEFAULT CONFIG_RCU_LAZY CONFIG_RCU_LAZY_DEFAULT_OFF CONFIG_KURUMI_SCREEN_STATE \
+              CONFIG_BLK_WBT CONFIG_SCSI_SCAN_ASYNC CONFIG_PER_VMA_LOCK_STATS; do
               grep -E "^${sym}=|^# ${sym} is not set" "$AUD/final.config" || echo "$sym=<absent>"
             done
             echo
@@ -816,6 +834,7 @@ jobs:
           [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
           [ -f "$AK/files/dtb/kurumi_gpu.dtb" ] || { echo 'ERROR: files/dtb/kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
           [ -f "$AK/files/dtb/stock_gpu.dtb" ] || { echo 'ERROR: files/dtb/stock_gpu.dtb (stock GPU dtb for revert) missing'; exit 1; }
+
           # Drop the freshly built kernels in, replacing any stale images.
           # Ship variants under names AnyKernel will NOT auto-detect; the flash-time menu copies
           # the chosen one to $home/$IMGNAME before split_boot/flash_boot. Never ship a bare
@@ -839,6 +858,7 @@ jobs:
           chmod 0755 "$AK"/tools/* "$AK"/META-INF/com/google/android/update-binary || true
           mkdir -p "$GITHUB_WORKSPACE/out-artifacts"
           ZIP="$GITHUB_WORKSPACE/out-artifacts/Kurumi_kernel_build${GITHUB_RUN_NUMBER}.zip"
+          rm -f "$ZIP"
           ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
           echo 'Kurumi zip contents:'; unzip -l "$ZIP"
 
