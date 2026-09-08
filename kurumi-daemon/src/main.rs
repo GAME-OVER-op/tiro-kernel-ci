@@ -10,13 +10,15 @@
 // No logging (settings are just applied).
 //
 // Behaviour:
-//   Once at start (after a short wait so vendor thermal services are up):
-//     - disable_thermal_services(): faithful port of mora's 6-stage burn-mode
-//       (stop services -> setprop -> pkill survivors -> zone mode=disabled ->
-//        cooling cur_state=0 -> unbind userspace LMh). Battery zone 74 untouched.
+//   Once at start (after a short wait so vendor post-boot policy has settled):
 //     - core_ctl on the big clusters (cpu2/cpu5/cpu7): allow core sleep.
-//     - cpufreq floor/ceiling pinned per cluster to the true HW min/max OPP
-//       (undo powerHAL/perfd raising scaling_min above the hardware minimum).
+//     - cpufreq profile CEILINGS only. The kernel-native Kurumi base-min guard
+//       owns scaling_min_freq and keeps the sysfs base request at the real HW
+//       minimum while preserving independent WALT/input freq_qos boosts.
+//     - thermal services/zones/cooling devices are NOT touched here. The
+//       kernel-native Kurumi performance guard accepts CPU/GPU/display thermal
+//       requests but clamps their effective cooling state to 0, while leaving
+//       critical/battery/BCL/PMIC/UFS/DDR/modem and LMH protections intact.
 //     - vm.max_map_count = 1048576 (headroom for Wine/Winlator emulators).
 //     - apply_surfaceflinger(): move every surfaceflinger thread from cpuset
 //       system-background ("0-1,5-6" on this ROM) to foreground ("0-7"), and
@@ -43,12 +45,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// ---- thermal zones (exact IDs from the device / mora reference) ----
-const CPU_ZONE_IDS: &[u32] = &[
-    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29,
-];
-const GPU_ZONE_IDS: &[u32] = &[41, 42, 43, 44, 45, 46, 47, 48];
-
 // ---- core_ctl: first CPU of each BIG cluster. Topology is 2+3+2+1:
 //      cpu0-1 (little, left alone) | cpu2-4 | cpu5-6 | cpu7. core_ctl nodes live
 //      only on a cluster's first cpu -> cpu2, cpu5, cpu7. ----
@@ -60,7 +56,7 @@ const TOUCH_HINT_VALUE: &str = "500";
 const TOUCH_DEBOUNCE_MS: u64 = 400;
 
 // ---- timing ----
-const BOOT_WAIT_SECS: u64 = 90;
+const POST_BOOT_SETTLE_SECS: u64 = 90;
 const BURST_WINDOW_SECS: u64 = 20 * 60;
 const BURST_INTERVAL_SECS: u64 = 60;
 const STEADY_TICK_SECS: u64 = 3600;
@@ -79,11 +75,11 @@ const SCREEN_POLL_MAX_MS: u64 = 300_000;
 // Conservative temporary fallback while the panel is off.  It is intentionally
 // runtime-only: chosen flash profile is restored immediately when the screen
 // turns on again.
-const SCREEN_OFF_CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
-    (0, "364800", "1812480"),
-    (2, "499200", "2204160"),
-    (5, "499200", "1182720"),
-    (7, "480000", "1320960"),
+const SCREEN_OFF_CPUFREQ_MAX_LIMITS: &[(u32, &str)] = &[
+    (0, "1812480"),
+    (2, "2204160"),
+    (5, "1182720"),
+    (7, "1320960"),
 ];
 const SCREEN_OFF_UFS_CLKGATE: &str = "1";
 const SCREEN_OFF_UFS_CLKSCALE: &str = "1";
@@ -139,109 +135,6 @@ fn put_global_setting(key: &str, val: &str) {
     run_cmd("settings", &["put", "global", key, val]);
 }
 
-// ---------- one-time: thermal burn-mode (faithful port of mora) ----------
-
-const STOP_SERVICES: &[&str] = &[
-    "android.thermal-hal",
-    "vendor.thermal-engine",
-    "vendor.thermal_manager",
-    "vendor.thermal-manager",
-    "vendor.thermal-hal-2-0",
-    "vendor.thermal-symlinks",
-    "thermal_mnt_hal_service",
-    "thermal",
-    "mi_thermald",
-    "thermald",
-    "thermalloadalgod",
-    "thermalservice",
-    "sec-thermal-1-0",
-    "debug_pid.sec-thermal-1-0",
-    "thermal-engine",
-    "vendor.thermal-hal-1-0",
-    "vendor-thermal-1-0",
-    "thermal-hal",
-    "vendor.qti.hardware.perf2-hal-service",
-    "qti-msdaemon_vendor-0",
-    "qti-msdaemon_vendor-1",
-    "qti-ssdaemon_vendor",
-];
-
-const SETPROP_STOPPED: &[(&str, &str)] = &[
-    ("init.svc.thermal", "stopped"),
-    ("init.svc.thermal-managers", "stopped"),
-    ("init.svc.thermal_manager", "stopped"),
-    ("init.svc.thermal_mnt_hal_service", "stopped"),
-    ("init.svc.thermal-engine", "stopped"),
-    ("init.svc.mi-thermald", "stopped"),
-    ("init.svc.thermalloadalgod", "stopped"),
-    ("init.svc.thermalservice", "stopped"),
-    ("init.svc.thermal-hal", "stopped"),
-    ("init.svc.vendor.thermal-symlinks", ""),
-    ("init.svc.android.thermal-hal", "stopped"),
-    ("init.svc.vendor.thermal-hal", "stopped"),
-    ("init.svc.thermal-manager", "stopped"),
-    ("init.svc.vendor-thermal-hal-1-0", "stopped"),
-    ("init.svc.vendor.thermal-hal-1-0", "stopped"),
-    ("init.svc.vendor.thermal-hal-2-0.mtk", "stopped"),
-    ("init.svc.vendor.thermal-hal-2-0", "stopped"),
-];
-
-const KILL_PATTERNS: &[&str] = &[
-    "thermal-service.qti",
-    "android.hardware.thermal",
-    "thermal-engine",
-    "thermald",
-];
-
-fn disable_thermal_services() {
-    // 1) stop known thermal init services
-    for svc in STOP_SERVICES {
-        let _ = Command::new("stop").arg(svc).output();
-        thread::sleep(Duration::from_millis(50));
-    }
-    // 2) mark them stopped so init does not restart them
-    for (prop, val) in SETPROP_STOPPED {
-        let _ = Command::new("setprop").arg(prop).arg(val).output();
-        thread::sleep(Duration::from_millis(50));
-    }
-    // 3) hard-kill survivors that keep applying mitigations
-    for pat in KILL_PATTERNS {
-        let _ = Command::new("pkill").arg("-f").arg(pat).output();
-        thread::sleep(Duration::from_millis(50));
-    }
-    // 4) disable in-kernel thermal on CPU/GPU zones (battery/BCL left untouched)
-    for &id in CPU_ZONE_IDS.iter().chain(GPU_ZONE_IDS.iter()) {
-        let _ = fs::write(
-            format!("/sys/class/thermal/thermal_zone{}/mode", id),
-            "disabled",
-        );
-    }
-    // 5) reset already-engaged CPU/GPU cooling devices back to 0
-    if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("cooling_device") {
-                continue;
-            }
-            let p = entry.path();
-            let ty = fs::read_to_string(p.join("type")).unwrap_or_default();
-            let ty = ty.trim();
-            if ty.starts_with("cpufreq-")
-                || ty.starts_with("cpu-cluster")
-                || ty.starts_with("thermal-cluster")
-                || ty == "gpu"
-            {
-                let _ = fs::write(p.join("cur_state"), "0");
-            }
-        }
-    }
-    // 6) unbind the userspace LMh driver (real enforcer is CPUCP firmware)
-    let _ = fs::write(
-        "/sys/bus/platform/drivers/msm_lmh_dcvs/unbind",
-        "soc:qcom,limits-dcvs",
-    );
-}
-
 // ---------- one-time: core_ctl + memory ----------
 
 fn apply_core_ctl() {
@@ -265,7 +158,7 @@ fn apply_memory() {
 
 // ---------- one-time: UFS + block read-ahead profile ----------
 // The daemon is launched by init.kurumi.rc only after sys.boot_completed=1.
-// main() then sleeps BOOT_WAIT_SECS (90s). This means these I/O tunables are
+// main() then sleeps POST_BOOT_SETTLE_SECS (90s). This means these I/O tunables are
 // applied only once, after boot_completed + 90s, after vendor init has settled.
 // No screen polling / idle loop is needed.
 //
@@ -466,48 +359,39 @@ fn apply_surfaceflinger() {
     write_if_diff("/sys/class/kgsl/kgsl-3d0/idle_timer", "120");
 }
 
-// ---------- one-time + periodic: cpufreq floor / ceiling ----------
-// On init powerHAL/perfd raises scaling_min_freq one or two OPP steps above the
-// true hardware minimum, which wastes idle power. mora pins each cluster back to
-// its lowest / highest AVAILABLE OPP. Values are hard-coded (KHz) from THIS
-// device's cpufreq tables (RedMagic 9 Pro, SM8650 pineapple); see each policy's
-// scaling_available_frequencies:
-//   policy0 (cpu0-1, little): 364800 .. 2265600
-//   policy2 (cpu2-4, gold):   499200 .. 3148800
-//   policy5 (cpu5-6, gold):   499200 .. 2956800
-//   policy7 (cpu7, prime):    480000 .. 3302400
-// (min, max) per first-cpu policy id. If a table ever changes these become
-// no-ops that just clamp to whatever the node accepts -- never above HW max.
+// ---------- one-time + screen-state: cpufreq profile ceilings ----------
+//
+// The kernel-native KURUMI_CPU_BASE_MIN_GUARD owns the sysfs base-min request,
+// so userspace no longer writes scaling_min_freq. This deliberately preserves
+// independent freq_qos clients such as WALT input boost (e.g. the short
+// policy0 1248000 kHz pulse observed on-device).
+//
 // Profile is chosen at BUILD time via a cargo feature (eco|balance|full). CI
-// compiles one binary per profile from THIS single source and the flasher
-// installs the one the user picks; ONLY this table differs between them.
-//   little = policy0 (cpu0-1), mid = policy2 (cpu2-4),
-//   big    = policy5 (cpu5-6), prime = policy7 (cpu7).
-// full == true HW min/max on every cluster.
+// compiles one binary per profile from this source and the flasher installs the
+// selected one. Values below are maximum ceilings only (KHz):
+//   policy0 = cpu0-1 little, policy2 = cpu2-4, policy5 = cpu5-6, policy7 = prime.
 #[cfg(feature = "full")]
-const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
-    (0, "364800", "2265600"),
-    (2, "499200", "3148800"),
-    (5, "499200", "2956800"),
-    (7, "480000", "3302400"),
+const CPUFREQ_MAX_LIMITS: &[(u32, &str)] = &[
+    (0, "2265600"),
+    (2, "3148800"),
+    (5, "2956800"),
+    (7, "3302400"),
 ];
 
-// eco: little ceiling ~80%, mid ~70%, big+prime ~40% of HW max (floor = HW min).
 #[cfg(feature = "eco")]
-const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
-    (0, "364800", "1812480"),
-    (2, "499200", "2204160"),
-    (5, "499200", "1182720"),
-    (7, "480000", "1320960"),
+const CPUFREQ_MAX_LIMITS: &[(u32, &str)] = &[
+    (0, "1812480"),
+    (2, "2204160"),
+    (5, "1182720"),
+    (7, "1320960"),
 ];
 
-// balance: little untouched, mid ~80%, big+prime ~70% of HW max.
 #[cfg(feature = "balance")]
-const CPUFREQ_LIMITS: &[(u32, &str, &str)] = &[
-    (0, "364800", "2265600"),
-    (2, "499200", "2519040"),
-    (5, "499200", "2069760"),
-    (7, "480000", "2311680"),
+const CPUFREQ_MAX_LIMITS: &[(u32, &str)] = &[
+    (0, "2265600"),
+    (2, "2519040"),
+    (5, "2069760"),
+    (7, "2311680"),
 ];
 
 // Refuse to build a daemon with no profile selected or with multiple profiles.
@@ -521,21 +405,18 @@ compile_error!("select exactly one profile feature: eco | balance | full");
 ))]
 compile_error!("select exactly one profile feature: eco | balance | full");
 
-fn apply_cpufreq_limit_table(limits: &[(u32, &str, &str)]) {
-    for &(policy, min, max) in limits {
+fn apply_cpufreq_max_table(limits: &[(u32, &str)]) {
+    for &(policy, max) in limits {
         let base = format!("/sys/devices/system/cpu/cpufreq/policy{}", policy);
         if !Path::new(&base).exists() {
             continue;
         }
-        // Raise the ceiling before lowering the floor so scaling_min can never
-        // transiently exceed scaling_max (kernel rejects that write).
         write_if_diff(format!("{}/scaling_max_freq", base), max);
-        write_if_diff(format!("{}/scaling_min_freq", base), min);
     }
 }
 
 fn apply_cpufreq_limits() {
-    apply_cpufreq_limit_table(CPUFREQ_LIMITS);
+    apply_cpufreq_max_table(CPUFREQ_MAX_LIMITS);
 }
 
 // ---------- periodic: WALT cpufreq smoothing + VM ----------
@@ -588,7 +469,7 @@ fn read_screen_poll_ms(state: ScreenState) -> u64 {
 
 fn apply_screen_off_fallback() {
     apply_core_ctl();
-    apply_cpufreq_limit_table(SCREEN_OFF_CPUFREQ_LIMITS);
+    apply_cpufreq_max_table(SCREEN_OFF_CPUFREQ_MAX_LIMITS);
     apply_ufs_values(SCREEN_OFF_UFS_CLKGATE, SCREEN_OFF_UFS_CLKSCALE);
     apply_read_ahead_value(SCREEN_OFF_READ_AHEAD_KB);
 }
@@ -733,9 +614,9 @@ fn main() {
     let screen_active = Arc::new(AtomicBool::new(true));
     spawn_touch_threads(Arc::clone(&last_touch), Arc::clone(&screen_active));
 
-    // One-time setup, after vendor thermal services have come up so `stop` bites.
-    thread::sleep(Duration::from_secs(BOOT_WAIT_SECS));
-    disable_thermal_services();
+    // One-time userspace setup after vendor post-boot tunables have settled.
+    // Thermal protection policy is active in-kernel from the beginning of boot.
+    thread::sleep(Duration::from_secs(POST_BOOT_SETTLE_SECS));
     apply_core_ctl();
     apply_cpufreq_limits();
     apply_memory();
@@ -756,7 +637,6 @@ fn main() {
     }
 
     // Steady state: hourly tick. Only WALT/VM is re-asserted every 3h.
-    // Thermal disabling is intentionally one-shot at boot after BOOT_WAIT_SECS.
     let mut walt_acc: u64 = 0;
     loop {
         thread::sleep(Duration::from_secs(STEADY_TICK_SECS));

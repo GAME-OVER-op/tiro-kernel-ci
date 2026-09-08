@@ -216,6 +216,11 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/kurumi_integrate_screen_state.sh" "$PWD"
           grep -q '^CONFIG_KURUMI_SCREEN_STATE=y' common/arch/arm64/configs/gki_defconfig || { echo 'ERROR: KURUMI screen config missing'; exit 1; }
           grep -q 'kurumi_screen_state_from_backlight' common/drivers/video/backlight/backlight.c || { echo 'ERROR: KURUMI backlight hook missing'; exit 1; }
+          echo '--- Kurumi: kernel-native thermal performance/base-min/ramoops guard ---'
+          python3 "$GITHUB_WORKSPACE/scripts/kurumi_integrate_performance_guard.py" common sm8650-devicetrees
+          grep -q 'KURUMI_PERFORMANCE_THERMAL_GUARD' common/drivers/thermal/thermal_helpers.c || { echo 'ERROR: Kurumi thermal guard missing'; exit 1; }
+          grep -q 'KURUMI_CPU_BASE_MIN_GUARD' common/drivers/cpufreq/cpufreq.c || { echo 'ERROR: Kurumi CPU base-min guard missing'; exit 1; }
+          grep -q 'KURUMI_RAMOOPS_LAYOUT_GUARD' common/fs/pstore/ram.c || { echo 'ERROR: Kurumi ramoops fallback missing'; exit 1; }
 
       - name: Sanity-check kleaf compatibility (super_image)
         working-directory: /mnt/src/kp/kernel_platform
@@ -509,6 +514,15 @@ jobs:
           basename "$IMG" > "$GITHUB_WORKSPACE/kimg/imgname"
           echo "stashed stock image: $IMG (flash name $(cat "$GITHUB_WORKSPACE/kimg/imgname"))"
 
+      - name: Capture stock crash-debug symbols
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          bash "$GITHUB_WORKSPACE/scripts/kurumi_capture_crash_debug.sh" \
+            stock "$PWD/out" "$PWD/$DIST" "$PWD/common" "$PWD/sm8650-devicetrees"
+
       - name: Print kernel release string (diagnostic, non-fatal)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
@@ -668,8 +682,12 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/kimg"
           # Snapshot the already-patched common tree after the stock build. Root variants are built
           # from this exact baseline so stock, KSU, and KSU+susfs differ only by root/susfs code.
+          git -C common config user.name "Kurumi CI"
+          git -C common config user.email "kurumi-ci@users.noreply.github.com"
           git -C common add -A
-          git -C common commit -m "kurumi base before root variants" || true
+          if ! git -C common diff --cached --quiet; then
+            git -C common commit -m "kurumi base before root variants"
+          fi
           git -C common rev-parse HEAD > "$GITHUB_WORKSPACE/kimg/common_base_commit"
           echo "common baseline: $(cat "$GITHUB_WORKSPACE/kimg/common_base_commit")"
 
@@ -760,6 +778,8 @@ jobs:
             echo 'OK: CONFIG_KSU=y baked into KSU Image'
             cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu"
             echo "stashed KSU image: $IMG -> kimg/kurumi_ksu"
+            bash "$GITHUB_WORKSPACE/scripts/kurumi_capture_crash_debug.sh" \
+              ksu "$PWD/out" "$PWD/$DIST" "$PWD/common" "$PWD/sm8650-devicetrees"
           else
             echo 'WARN: CONFIG_KSU=y not detected in KSU Image config - KSU-only variant skipped'
             rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
@@ -802,6 +822,8 @@ jobs:
             echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y baked into KSU+susfs Image'
             cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
             echo "stashed KSU+susfs image: $IMG -> kimg/kurumi_ksu_susfs"
+            bash "$GITHUB_WORKSPACE/scripts/kurumi_capture_crash_debug.sh" \
+              ksu-susfs "$PWD/out" "$PWD/$DIST" "$PWD/common" "$PWD/sm8650-devicetrees"
           else
             echo 'WARN: CONFIG_KSU_SUSFS=y not detected in Image config - KSU+susfs variant skipped'
             rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
@@ -861,6 +883,16 @@ jobs:
           rm -f "$ZIP"
           ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
           echo 'Kurumi zip contents:'; unzip -l "$ZIP"
+
+      - name: Upload crash-debug symbols
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiro-kernel-crash-debug
+          path: crash-debug/**
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

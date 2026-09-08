@@ -4,11 +4,12 @@ CI that downloads every required source and builds the **Kurumi Kernel** (and,
 optionally, a full ROM) for **Nubia / RedMagic tiro (NX769J / NX769S, RedMagic 9
 Pro)** - Snapdragon 8 Gen 3 / SM8650 "pineapple", Linux 6.1, LineageOS 23.2.
 
-## Two workflows
-| Workflow | Builds | Artifact |
-|---|---|---|
-| `.github/workflows/build-kernel.yml` | Kernel only + `Kurumi_kernel_build<N>.zip` | `tiro-kernel` |
-| `.github/workflows/build-rom.yml` | Full LineageOS 23.2 ROM | `tiro-rom` |
+## Workflows
+| Workflow | Builds | Main artifact | Crash-debug artifact |
+|---|---|---|---|
+| `.github/workflows/build-kernel.yml` | Stock / KSU / KSU+SuSFS kernel variants + `Kurumi_kernel_build<N>.zip` | `tiro-kernel` | `tiro-kernel-crash-debug` |
+| `.github/workflows/build-kernel-susfs-fast.yml` | Fast KSU+SuSFS kernel path | `tiro-kernel-susfs-fast` | `tiro-kernel-susfs-fast-crash-debug` |
+| `.github/workflows/build-rom.yml` | Full LineageOS 23.2 ROM | `tiro-rom` | `tiro-rom-crash-debug` |
 
 
 ## Current build plan
@@ -27,7 +28,7 @@ The flashable AnyKernel package can ship up to three real kernel images and show
 
 Vol Down moves the cursor; Vol Up selects, matching the Rust profile selector.
 
-## In-kernel battery tweak (overlay.d)
+## Runtime profile daemon (overlay.d)
 The battery tuning ships inside the kernel flash - no separate Magisk module.
 `anykernel/ramdisk/overlay.d/` is injected into the device ramdisk (`init_boot`
 on GKI) and imported by Magisk, which runs `kurumi_battery` on boot:
@@ -65,6 +66,44 @@ stays off for 30 seconds it temporarily applies an Eco-like CPU/UFS fallback;
 when the screen turns on it restores the selected flash-time profile. Touch boost
 is also suppressed while the kernel reports the screen as off.
 
+
+
+## Kernel-native performance guard
+
+`scripts/kurumi_integrate_performance_guard.py` is applied to the kernel tree
+that produces the booted Image. It keeps thermal sensing/critical trips and
+hardware/safety protection active, but forces CPU/GPU/`display-fps` thermal
+performance cooling requests to effective state `0` in both the thermal-core
+governor path and userspace `cooling_device*/cur_state` path. Matching uses
+cooling-device type strings, never unstable numeric IDs. Battery/charging,
+BCL/PMIC, UFS, DDR, modem and WLAN cooling devices are not matched.
+
+The same integration keeps the base userspace `scaling_min_freq` QoS request at
+the real hardware minimum. Independent WALT/input `freq_qos` boosts are separate
+requests and remain functional. The Rust daemon therefore applies only its CPU
+maximum profile ceilings and no longer stops/kills thermal services, disables
+thermal zones, resets cooling devices, or unbinds LMH.
+
+Tiro's observed 2 MiB all-pmsg ramoops layout is corrected to 1 MiB panic/oops
+dmesg + 512 KiB console + 512 KiB pmsg. A narrowly-scoped kernel fallback also
+handles the existing stock vendor_boot DTB preserved by the kernel-only flasher.
+See `docs/KURUMI_PERFORMANCE_GUARD.md` for implementation and validation.
+
+> **Thermal safety:** this intentionally removes normal CPU/GPU/display software
+> thermal performance throttling and can raise sustained temperature/power.
+> Critical shutdown, LMH/EPSS and non-performance safety paths are deliberately
+> retained, but they are not a substitute for stock thermal policy.
+
+## Persistent panic evidence
+
+Every workflow now attempts to retain the exact Image/boot images, compressed
+`vmlinux`, `System.map`, `Module.symvers`, embedded final config, source identity
+and checksums in a separate crash-debug artifact. Keep the matching artifact for
+each flashed build so a future Qualcomm minidump/EDL crash can be symbolized.
+
+For long-running phone-side diagnostics, the repository also includes the
+manual root tool `scripts/kurumi_device_panic_logger.sh`; it is **not** installed
+or started automatically.
 
 ## Kernel-only daily-use / autonomy changes
 The kernel workflow applies the autonomy layer to the **actual common GKI Image**, not only to the vendor fragment:

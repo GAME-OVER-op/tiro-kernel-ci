@@ -2,7 +2,7 @@
 name = "kurumi"
 version = "1.0.0"
 edition = "2021"
-description = "Kurumi kernel userspace perf/thermal daemon (RedMagic 9 Pro / SM8650)"
+description = "Kurumi kernel userspace performance/profile daemon (RedMagic 9 Pro / SM8650)"
 
 [[bin]]
 name = "kurumi"

@@ -1,10 +1,11 @@
 #
-# Kurumi Kernel - userspace perf/thermal daemon (Rust, static aarch64)
+# Kurumi Kernel - userspace profile daemon (Rust, static aarch64)
 # overlay.d rc imported by Magisk. Launches the daemon in the BACKGROUND on
 # boot_completed. We use exec_background (NOT exec): the daemon runs
 # persistently (touch-boost + periodic re-apply), and exec would block the
-# init action forever. The daemon writes ONLY to /sys and /proc -> fully
-# reversible, no partition writes.
+# init action forever. The daemon writes ONLY profile/runtime tunables to /sys and /proc -> fully
+# reversible, no partition writes. CPU/GPU/display thermal mitigation is handled
+# in-kernel by the Kurumi performance guard; this daemon does not stop thermal services.
 #
 
 on property:sys.boot_completed=1

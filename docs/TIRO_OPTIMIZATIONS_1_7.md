@@ -202,3 +202,24 @@ scripts/kurumi_verify_tiro_optimizations.py
 
 The upstream Nubia repository is still fetched cleanly on every CI run; the experiment is applied only inside CI.
 
+
+
+## Kurumi kernel-native performance guard (post 1–7 layer)
+
+The current CI also applies `scripts/kurumi_integrate_performance_guard.py` to
+the kernel that actually produces the flashed Image. It is separate from the
+experimental 1–7 vendor-module backports.
+
+The guard keeps thermal sensing, critical trips and non-performance safety
+coolers active, but forces CPU hotplug/pause/cpufreq/cluster, Adreno KGSL GPU and
+`display-fps` thermal cooling requests to effective state `0`. It intercepts
+both thermal-core governor updates and userspace `cur_state` writes, and matches
+cooling-device **types**, never registration-order numeric IDs.
+
+It also prevents vendor post-boot scripts from leaving the base
+`scaling_min_freq` sysfs QoS request above the hardware minimum. Independent
+WALT/input freq-QoS boost requests are not changed.
+
+For crash diagnosis it corrects the 2 MiB Tiro ramoops layout to 1 MiB dmesg,
+512 KiB console and 512 KiB pmsg, with a GKI fallback for installations that
+preserve the stock `vendor_boot` DTB.
