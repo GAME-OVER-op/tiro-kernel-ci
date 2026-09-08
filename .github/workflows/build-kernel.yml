@@ -884,17 +884,9 @@ jobs:
           ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
           echo 'Kurumi zip contents:'; unzip -l "$ZIP"
 
-      - name: Upload crash-debug symbols
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tiro-kernel-crash-debug
-          path: crash-debug/**
-          if-no-files-found: warn
-          compression-level: 0
-          retention-days: 14
-
-      - name: Upload artifacts
+      - name: Upload standalone Kleaf kernel artifacts only
+        # Standalone kernel workflow: do not upload boot/vendor_boot/disk images.
+        # The Kleaf dist Image/System.map/config artifacts are the deliverable.
         uses: actions/upload-artifact@v4
         with:
           name: tiro-kernel
