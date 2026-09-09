@@ -514,15 +514,6 @@ jobs:
           basename "$IMG" > "$GITHUB_WORKSPACE/kimg/imgname"
           echo "stashed stock image: $IMG (flash name $(cat "$GITHUB_WORKSPACE/kimg/imgname"))"
 
-      - name: Capture stock crash-debug symbols
-        working-directory: /mnt/src/kp/kernel_platform
-        run: |
-          set -e
-          DIST=out/msm-kernel-pineapple-gki/dist
-          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
-          bash "$GITHUB_WORKSPACE/scripts/kurumi_capture_crash_debug.sh" \
-            stock "$PWD/out" "$PWD/$DIST" "$PWD/common" "$PWD/sm8650-devicetrees"
-
       - name: Print kernel release string (diagnostic, non-fatal)
         working-directory: /mnt/src/kp/kernel_platform
         run: |
@@ -778,8 +769,6 @@ jobs:
             echo 'OK: CONFIG_KSU=y baked into KSU Image'
             cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu"
             echo "stashed KSU image: $IMG -> kimg/kurumi_ksu"
-            bash "$GITHUB_WORKSPACE/scripts/kurumi_capture_crash_debug.sh" \
-              ksu "$PWD/out" "$PWD/$DIST" "$PWD/common" "$PWD/sm8650-devicetrees"
           else
             echo 'WARN: CONFIG_KSU=y not detected in KSU Image config - KSU-only variant skipped'
             rm -f "$GITHUB_WORKSPACE/kimg/ksu_ok"
@@ -822,8 +811,6 @@ jobs:
             echo 'OK: CONFIG_KSU=y and CONFIG_KSU_SUSFS=y baked into KSU+susfs Image'
             cp -v "$IMG" "$GITHUB_WORKSPACE/kimg/kurumi_ksu_susfs"
             echo "stashed KSU+susfs image: $IMG -> kimg/kurumi_ksu_susfs"
-            bash "$GITHUB_WORKSPACE/scripts/kurumi_capture_crash_debug.sh" \
-              ksu-susfs "$PWD/out" "$PWD/$DIST" "$PWD/common" "$PWD/sm8650-devicetrees"
           else
             echo 'WARN: CONFIG_KSU_SUSFS=y not detected in Image config - KSU+susfs variant skipped'
             rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
@@ -884,9 +871,9 @@ jobs:
           ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
           echo 'Kurumi zip contents:'; unzip -l "$ZIP"
 
-      - name: Upload standalone Kleaf kernel artifacts only
-        # Standalone kernel workflow: do not upload boot/vendor_boot/disk images.
-        # The Kleaf dist Image/System.map/config artifacts are the deliverable.
+      # Standalone Kleaf produces the flashable kernel-only ZIP above. Do not upload crash/debug
+      # images here: they are large and can exhaust GitHub runner disk space.
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tiro-kernel
