@@ -29,7 +29,10 @@ for r in /sys/class/remoteproc/remoteproc*; do
     [ -e "$r/name" ] || continue
     n="$(cat "$r/name" 2>/dev/null)"
     case "$n" in
-        *remoteproc-mss*)
+        *spss*)
+            echo "$n: skipped (secure processor, recovery stays disabled)"
+            ;;
+        *)
             cur="$(cat "$r/recovery" 2>/dev/null)"
             if [ "$cur" = "enabled" ]; then
                 echo "$n: recovery already enabled"
@@ -41,9 +44,6 @@ for r in /sys/class/remoteproc/remoteproc*; do
                     echo "$n: FAILED to enable (cur=$cur)"
                 fi
             fi
-            ;;
-        *)
-            echo "$n: unchanged (recovery=$(cat "$r/recovery" 2>/dev/null))"
             ;;
     esac
 done

@@ -871,6 +871,22 @@ jobs:
           ( cd "$AK" && zip -r9 "$ZIP" . -x '.git*' )
           echo 'Kurumi zip contents:'; unzip -l "$ZIP"
 
+      # Kleaf dist already contains a boot.img with a generic ramdisk. Ship it
+      # (plus the raw Image) so the `fastboot boot boot.img` RAM-testing flow
+      # documented above works straight from the artifacts, without flashing.
+      - name: Stage flashable images for RAM-boot testing
+        working-directory: /mnt/src/kp/kernel_platform
+        run: |
+          set -e
+          DIST=out/msm-kernel-pineapple-gki/dist
+          [ -d "$DIST" ] || DIST="$(dirname "$(find out -type f -name 'boot.img' -path '*dist*' 2>/dev/null | head -1)")"
+          if [ ! -d "$DIST" ]; then echo 'WARN: no dist dir with boot.img found'; exit 0; fi
+          mkdir -p "$GITHUB_WORKSPACE/out-artifacts/images"
+          for f in boot.img Image Image.gz Image.lz4 kernel.release; do
+            [ -f "$DIST/$f" ] && cp -v "$DIST/$f" "$GITHUB_WORKSPACE/out-artifacts/images/"
+          done
+          ls -la "$GITHUB_WORKSPACE/out-artifacts/images"
+
       # Standalone Kleaf produces the flashable kernel-only ZIP above. Do not upload crash/debug
       # images here: they are large and can exhaust GitHub runner disk space.
       - name: Upload artifacts

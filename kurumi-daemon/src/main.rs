@@ -606,34 +606,34 @@ fn spawn_touch_threads(last: Arc<Mutex<Instant>>, screen_active: Arc<AtomicBool>
     }
 }
 
-// ---------- one-time: modem remoteproc SSR recovery ----------
+// ---------- one-time: remoteproc SSR recovery ----------
 // The Nubia kernel hardcodes recovery_disabled=true for every PAS remoteproc
-// (drivers/remoteproc/qcom_q6v5_pas.c:1832), so a modem firmware fatal error
-// panics the whole device into Qualcomm CrashDump instead of restarting the
-// modem ("rproc recovery state: disabled and lead to device crash"). Observed
-// in the wild: lte_rrc_plmn_search.c:9211 assert during PLMN search.
-//
-// The remoteproc core is built into the GKI Image (CONFIG_REMOTEPROC=y) and
-// exposes a runtime switch at /sys/class/remoteproc/remoteproc*/recovery; the
-// PAS driver keeps its internal cache in sync via the
+// (drivers/remoteproc/qcom_q6v5_pas.c:1832), so ANY subsystem firmware fatal
+// error panics the whole device into Qualcomm CrashDump instead of restarting
+// the subsystem ("rproc recovery state: disabled and lead to device crash").
+// Observed in the wild: modem assert lte_rrc_plmn_search.c:9211 during PLMN
+// search. The remoteproc core is built into the GKI Image (CONFIG_REMOTEPROC=y)
+// and exposes a runtime switch at /sys/class/remoteproc/remoteproc*/recovery;
+// the PAS driver keeps its internal cache in sync via the
 // android_vh_rproc_recovery_set vendor hook, so the toggle is respected.
-// Enable it for the modem so a crash becomes a short modem SSR instead.
+// Enable recovery for every PAS subsystem except spss (the secure processor
+// is deliberately excluded by the vendor hook itself); a firmware crash then
+// becomes a short SSR restart instead of a full device panic.
 
-fn apply_modem_recovery() {
+fn apply_rproc_recovery() {
     if let Ok(entries) = fs::read_dir("/sys/class/remoteproc") {
         for entry in entries.flatten() {
             let name = match read_trim(entry.path().join("name")) {
                 Some(n) => n,
                 None => continue,
             };
-            if !name.ends_with("remoteproc-mss") {
+            if name.contains("spss") {
                 continue;
             }
             let recovery = entry.path().join("recovery");
             if read_trim(&recovery).as_deref() != Some("enabled") {
                 write_val(&recovery, "enabled");
             }
-            break;
         }
     }
 }
@@ -641,9 +641,9 @@ fn apply_modem_recovery() {
 // ---------- main ----------
 
 fn main() {
-    // Enable modem SSR recovery before anything else: the modem is up by
-    // boot_completed and every second without recovery is a crash window.
-    apply_modem_recovery();
+    // Enable subsystem SSR recovery before anything else: the modem/ADSP are
+    // up by boot_completed and every second without recovery is a crash window.
+    apply_rproc_recovery();
 
     // Touch-boost threads start immediately; they block on input (~0 CPU idle).
     let last_touch = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
