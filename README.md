@@ -41,6 +41,7 @@ on GKI) and imported by Magisk, which runs `kurumi_battery` on boot:
 - Wi-Fi sleep/push profile after `boot_completed + 90s`:
   - `eco` / `balance`: delayed push. Wi-Fi stays ON, Android background scan/perf knobs are disabled, and only the direct WLAN endpoint `power/wakeup` is disabled. The PCIe parent chain is not touched.
   - `full`: soft push. Wi-Fi stays ON, Android background scan/perf knobs are disabled, and direct WLAN wakeup is kept/enabled so push notifications are close to stock.
+- Modem SSR recovery: the Rust daemon enables remoteproc recovery for the modem (`remoteproc-mss`) as its first action on boot. The Nubia kernel hardcodes `recovery_disabled=true` for PAS subsystems (`drivers/remoteproc/qcom_q6v5_pas.c:1832`), so a modem firmware fatal error (observed: `lte_rrc_plmn_search.c:9211` assert during PLMN search) panicked the whole device into Qualcomm CrashDump. With recovery on, the same event becomes a short modem restart. The remoteproc core ships in the GKI Image (`CONFIG_REMOTEPROC=y`), so the runtime switch works despite the driver being a vendor module. `scripts/kurumi_enable_modem_recovery.sh` is the standalone variant for installs that do not carry overlay.d.
 
 The Rust daemon is launched either through Magisk `overlay.d` or, on pure
 KernelSU/KSU+SuSFS installs without Magisk, through
