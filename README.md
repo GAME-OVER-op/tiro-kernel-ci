@@ -127,6 +127,24 @@ The kernel workflow applies the autonomy layer to the **actual common GKI Image*
 > re-targets `init_boot` (`reset_ak` + `setup_ak`) and repacks ONLY its ramdisk with
 > overlay.d added. Device check is OFF (`do.devicecheck=0`).
 
+### Flash-time ROM and GPU DTB selection
+
+The installer asks for the installed firmware **before** the kernel/profile menus:
+
+- **RedMagic OS (Stock)** sets the GPU DTB action to `skip`. The installer does not
+  stage, unpack, repack, or write `vendor_boot` for the GPU table at all.
+- **LineageOS (Custom)** opens a GPU DTB choice:
+  - **Stock GPU DTB** -> `files/dtb/stock_gpu.dtb`
+  - **Kurumi GPU DTB** -> a second menu selects one of:
+    - Low voltage -> `files/dtb/kurumi_gpu_low.dtb`
+    - Balanced -> `files/dtb/kurumi_gpu_balanced.dtb`
+    - High voltage -> `files/dtb/kurumi_gpu_high.dtb`
+
+The three Kurumi DTBs keep the Kurumi GPU frequency table and differ by their
+voltage/level table. A selected DTB is mandatory: the installer aborts if that
+exact file is missing and never silently falls back to stock or another voltage
+profile.
+
 ## Flashing (test in RAM first)
 ```bash
 adb reboot bootloader
@@ -139,6 +157,6 @@ MIT (see `anykernel/LICENSE`).
 
 ## Tiro vendor_boot / 1-7 compatibility note
 
-The experimental full `vendor_boot.img` installer has been removed. The flash ZIP keeps the original kernel-only flow and the existing DTB-only patch of the currently installed `vendor_boot`.
+The experimental full `vendor_boot.img` installer has been removed. The flash ZIP keeps the original kernel flow. `vendor_boot` is left completely untouched on RedMagic OS; on LineageOS only the selected GPU DTB section is patched in the currently installed `vendor_boot`.
 
 After early-boot testing, `CONFIG_BLK_WBT` remains disabled because it changes `struct request` and is unsafe to mix with the ROM's existing prebuilt vendor/vendor_dlkm modules. The standalone Kleaf workflow restores the two safer config changes: `CONFIG_SCSI_SCAN_ASYNC=y` and disabling `CONFIG_PER_VMA_LOCK_STATS` while keeping per-VMA locking itself. Qualcomm WALT/UFS items 4-7 remain source-level experiments only and are not delivered by replacing `vendor_boot`.

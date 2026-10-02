@@ -816,7 +816,7 @@ jobs:
             rm -f "$GITHUB_WORKSPACE/kimg/ksu_susfs_ok"
           fi
 
-      - name: Package Kurumi flashable zip (kernel only)
+      - name: Package Kurumi flashable zip
         working-directory: /mnt/src/kp/kernel_platform
         run: |
           set -e
@@ -841,8 +841,11 @@ jobs:
           # interactive-installer assets must be shipped too
           [ -f "$AK/tools/keycheck" ]       || { echo 'ERROR: tools/keycheck missing'; exit 1; }
           [ -f "$AK/tools/kurumi_menu.sh" ] || { echo 'ERROR: tools/kurumi_menu.sh missing'; exit 1; }
-          [ -f "$AK/files/dtb/kurumi_gpu.dtb" ] || { echo 'ERROR: files/dtb/kurumi_gpu.dtb (custom GPU table) missing'; exit 1; }
-          [ -f "$AK/files/dtb/stock_gpu.dtb" ] || { echo 'ERROR: files/dtb/stock_gpu.dtb (stock GPU dtb for revert) missing'; exit 1; }
+          # RedMagic OS skips vendor_boot DTB flashing entirely. LineageOS offers stock or
+          # one of three Kurumi voltage profiles, so all selectable DTBs must be present.
+          for dtb in stock_gpu.dtb kurumi_gpu_low.dtb kurumi_gpu_balanced.dtb kurumi_gpu_high.dtb; do
+            [ -f "$AK/files/dtb/$dtb" ] || { echo "ERROR: files/dtb/$dtb missing"; exit 1; }
+          done
 
           # Drop the freshly built kernels in, replacing any stale images.
           # Ship variants under names AnyKernel will NOT auto-detect; the flash-time menu copies

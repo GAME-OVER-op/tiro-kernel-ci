@@ -30,7 +30,8 @@ no_magisk_check=1
 . tools/ak3-core.sh
 
 ## ---- Kurumi interactive installer (keycheck/getevent driven menus) ----
-## Sets KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full), KSELINUX (permissive|enforcing), KGPU (0|1)
+## Sets KROM (redmagic|lineage), KGPU (skip|stock|kurumi_low|kurumi_balanced|kurumi_high),
+## KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing)
 . $home/tools/kurumi_menu.sh
 
 KURUMI_MODULE_DIR=/data/adb/modules/kurumi_kernel
@@ -195,17 +196,44 @@ if [ "$KROOT" = "stock" ] || [ "$KPROFILE" = "skip" ]; then
   kurumi_remove_data_module;
 fi;
 
-## GPU frequency table -> staged for the vendor_boot pass below (NOT boot). 'Yes' stages the
-## CUSTOM table; 'No' stages the STOCK dtb so the user can always revert. Either way the dtb is
-## written to vendor_boot further down; boot's own dtb is never touched. Staged under a private
-## name (kurumi_vendor_dtb) so AK3's split_boot/flash_boot never auto-injects it into boot.
-if [ "$KGPU" = "1" ] && [ -f "$home/files/dtb/kurumi_gpu.dtb" ]; then
-  cp -f "$home/files/dtb/kurumi_gpu.dtb" "$home/kurumi_vendor_dtb";
-  ui_print " " "Kurumi: CUSTOM GPU frequency table -> vendor_boot";
-elif [ -f "$home/files/dtb/stock_gpu.dtb" ]; then
-  cp -f "$home/files/dtb/stock_gpu.dtb" "$home/kurumi_vendor_dtb";
-  ui_print " " "Kurumi: STOCK GPU dtb -> vendor_boot (revert to stock)";
-fi;
+## GPU DTB selection -> staged for the vendor_boot pass below (NOT boot).
+## RedMagic OS sets KGPU=skip and MUST leave vendor_boot completely untouched.
+## LineageOS can install the stock GPU DTB or one of the three Kurumi voltage profiles.
+## Never silently fall back to another DTB: a missing explicitly selected file aborts.
+## Staged under a private name (kurumi_vendor_dtb) so AK3 never auto-injects it into boot.
+rm -f "$home/kurumi_vendor_dtb";
+case "$KGPU" in
+  skip)
+    ui_print " " "Kurumi: RedMagic OS selected - vendor_boot DTB will NOT be modified";
+    ;;
+  stock)
+    KGPU_FILE="$home/files/dtb/stock_gpu.dtb";
+    [ -f "$KGPU_FILE" ] || abort "Kurumi: selected stock GPU DTB is missing from zip";
+    cp -f "$KGPU_FILE" "$home/kurumi_vendor_dtb" || abort "Kurumi: failed to stage stock GPU DTB";
+    ui_print " " "Kurumi: LineageOS STOCK GPU DTB -> vendor_boot";
+    ;;
+  kurumi_low)
+    KGPU_FILE="$home/files/dtb/kurumi_gpu_low.dtb";
+    [ -f "$KGPU_FILE" ] || abort "Kurumi: selected LOW voltage GPU DTB is missing from zip";
+    cp -f "$KGPU_FILE" "$home/kurumi_vendor_dtb" || abort "Kurumi: failed to stage LOW voltage GPU DTB";
+    ui_print " " "Kurumi: LineageOS Kurumi LOW voltage GPU DTB -> vendor_boot";
+    ;;
+  kurumi_balanced)
+    KGPU_FILE="$home/files/dtb/kurumi_gpu_balanced.dtb";
+    [ -f "$KGPU_FILE" ] || abort "Kurumi: selected BALANCED GPU DTB is missing from zip";
+    cp -f "$KGPU_FILE" "$home/kurumi_vendor_dtb" || abort "Kurumi: failed to stage BALANCED GPU DTB";
+    ui_print " " "Kurumi: LineageOS Kurumi BALANCED GPU DTB -> vendor_boot";
+    ;;
+  kurumi_high)
+    KGPU_FILE="$home/files/dtb/kurumi_gpu_high.dtb";
+    [ -f "$KGPU_FILE" ] || abort "Kurumi: selected HIGH voltage GPU DTB is missing from zip";
+    cp -f "$KGPU_FILE" "$home/kurumi_vendor_dtb" || abort "Kurumi: failed to stage HIGH voltage GPU DTB";
+    ui_print " " "Kurumi: LineageOS Kurumi HIGH voltage GPU DTB -> vendor_boot";
+    ;;
+  *)
+    abort "Kurumi: invalid GPU DTB selection: $KGPU";
+    ;;
+esac;
 
 ## ---- Kernel image selection: stock / KernelSU-Next / KernelSU-Next + susfs ----
 ## CI ships up to THREE variants under files/image/ (names AnyKernel will NOT auto-detect):
@@ -250,7 +278,7 @@ cp -f "$KSEL" "$home/$IMGNAME";
 rm -f "$home/files/image/kurumi_stock" "$home/files/image/kurumi_ksu" "$home/files/image/kurumi_ksu_susfs";
 
 if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" ] || [ -e "/dev/block/by-name/init_boot$slot" ] || [ -L "/dev/block/bootdevice/by-name/init_boot_a" ] || [ -L "/dev/block/by-name/init_boot_a" ]; then
-  ## ---- GKI: kernel (+ optional GPU dtb) in boot, ramdisk (Magisk + overlay.d) in init_boot ----
+  ## ---- GKI: kernel in boot, ramdisk (Magisk + overlay.d) in init_boot; optional GPU DTB is handled in vendor_boot later ----
   split_boot;
   apply_selinux;
   flash_boot;
@@ -277,7 +305,7 @@ else
   kurumi_finalize_daemon_for_current_ramdisk;
   write_boot;
 fi;
-## ---- GPU dtb -> vendor_boot (independent of kernel; runs for BOTH 'custom' and 'stock') ----
+## ---- GPU DTB -> vendor_boot (LineageOS only; RedMagic OS skips this block entirely) ----
 ## The GPU frequency table lives in the vendor_boot dtb on this device, NOT in boot. AK3's auto
 ## multi-partition router would misroute a $home/dtb to vendor_kernel_boot on init_boot devices,
 ## and a full vendor_boot v4 ramdisk repack is unreliable - so swap ONLY the dtb surgically with

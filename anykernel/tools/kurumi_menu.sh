@@ -1,7 +1,7 @@
 #
 # Kurumi Kernel - interactive flash-time menu (getevent / keycheck driven)
 # Sourced by anykernel.sh AFTER tools/ak3-core.sh so ui_print/$bin/abort exist.
-# Exports: KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing), KGPU (0|1)
+# Exports: KROM (redmagic|lineage), KGPU (skip|stock|kurumi_low|kurumi_balanced|kurumi_high), KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing)
 #
 # Key model ($FUNCTION returns 0 for Vol Up, 1 for Vol Down):
 #   binary menus  -> Vol Up = Yes/first  | Vol Down = No/second
@@ -62,7 +62,68 @@ else
   $FUNCTION "DOWN";
 fi;
 
-# ---- 0) Kernel variant (scrolling cursor menu) ----
+# ---- 0) Installed firmware (binary, always first) ----
+# RedMagic OS must keep the installed vendor_boot DTB untouched.
+# LineageOS may optionally receive the stock GPU DTB or one of the Kurumi tables.
+ui_print " ";
+ui_print "------------------------------";
+ui_print " Installed firmware";
+ui_print "   Vol+ = RedMagic OS (Stock)";
+ui_print "   Vol- = LineageOS (Custom)";
+ui_print "------------------------------";
+if $FUNCTION; then
+  KROM=redmagic;
+  KGPU=skip;
+  ui_print " " "   -> ROM: RedMagic OS";
+  ui_print "   -> vendor_boot DTB: untouched";
+else
+  KROM=lineage;
+  ui_print " " "   -> ROM: LineageOS";
+
+  # ---- 1) LineageOS GPU DTB selection ----
+  ui_print " ";
+  ui_print "------------------------------";
+  ui_print " GPU DTB for LineageOS";
+  ui_print "   Vol+ = Kurumi GPU table";
+  ui_print "   Vol- = Stock GPU DTB";
+  ui_print "------------------------------";
+  if $FUNCTION; then
+    KGPU=kurumi;
+    ui_print " " "   -> GPU DTB: Kurumi";
+
+    # ---- 2) Kurumi voltage profile (scrolling cursor menu) ----
+    ui_print " ";
+    ui_print "------------------------------";
+    ui_print " Kurumi GPU voltage profile";
+    ui_print "   Vol Down = move cursor";
+    ui_print "   Vol Up   = select";
+    ui_print "------------------------------";
+    KV_IDX=1;
+    while true; do
+      ui_print " ";
+      if [ $KV_IDX -eq 0 ]; then ui_print " > Low voltage"; else ui_print "   Low voltage"; fi;
+      if [ $KV_IDX -eq 1 ]; then ui_print " > Balanced"; else ui_print "   Balanced"; fi;
+      if [ $KV_IDX -eq 2 ]; then ui_print " > High voltage"; else ui_print "   High voltage"; fi;
+      if $FUNCTION; then
+        break;
+      else
+        KV_IDX=$((KV_IDX + 1));
+        [ $KV_IDX -gt 2 ] && KV_IDX=0;
+      fi;
+    done;
+    case $KV_IDX in
+      0) KGPU=kurumi_low;;
+      2) KGPU=kurumi_high;;
+      *) KGPU=kurumi_balanced;;
+    esac;
+    ui_print " " "   -> Kurumi voltage: ${KGPU#kurumi_}";
+  else
+    KGPU=stock;
+    ui_print " " "   -> GPU DTB: stock";
+  fi;
+fi;
+
+# ---- 3) Kernel variant (scrolling cursor menu) ----
 # CI may ship up to three real Images:
 #   kurumi_stock      = no root
 #   kurumi_ksu        = KernelSU-Next only
@@ -104,7 +165,7 @@ case $KR_IDX in
 esac;
 ui_print " " "   -> kernel: $KROOT";
 
-# ---- 1) Battery daemon profile (scrolling cursor menu; 'Skip' = remove/do not install it) ----
+# ---- 4) Battery daemon profile (scrolling cursor menu; 'Skip' = remove/do not install it) ----
 # Runtime is decided later after the target ramdisk is inspected:
 #   Magisk present -> overlay.d in boot/init_boot
 #   no Magisk + KSU/SuSFS -> /data/adb/modules/kurumi_kernel
@@ -137,7 +198,7 @@ case $KP_IDX in
 esac;
 ui_print " " "   -> profile: $KPROFILE";
 
-# ---- 2) SELinux mode (binary) ----
+# ---- 5) SELinux mode (binary) ----
 ui_print " ";
 ui_print "------------------------------";
 ui_print " SELinux mode";
@@ -150,21 +211,6 @@ if $FUNCTION; then
 else
   KSELINUX=enforcing;
   ui_print " " "   -> SELinux: enforcing";
-fi;
-
-# ---- 3) Custom GPU frequency table (binary) ----
-ui_print " ";
-ui_print "------------------------------";
-ui_print " GPU frequency table (flashed to vendor_boot)";
-ui_print "   Vol+ = Yes - install CUSTOM table (adds 80/120/180 + 916 MHz)";
-ui_print "   Vol- = No  - restore STOCK dtb (revert to stock)";
-ui_print "------------------------------";
-if $FUNCTION; then
-  KGPU=1;
-  ui_print " " "   -> CUSTOM GPU table -> vendor_boot";
-else
-  KGPU=0;
-  ui_print " " "   -> STOCK GPU dtb -> vendor_boot (revert)";
 fi;
 
 rm -f $home/kurumi_events;
