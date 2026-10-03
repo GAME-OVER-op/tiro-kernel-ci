@@ -35,6 +35,8 @@
 //       comes up late), then re-assert every 3h (idempotent).
 // =====================================================================
 
+mod fan;
+
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -645,9 +647,20 @@ fn main() {
     // up by boot_completed and every second without recovery is a crash window.
     apply_rproc_recovery();
 
+    // One screen-state source is shared by touch boost and the fan governor.
+    // Start its existing kernel-bridge reader immediately so the cooler can
+    // stop thermal polling before the slower post-boot profile setup finishes.
+    let screen_active = Arc::new(AtomicBool::new(read_screen_state() != ScreenState::Off));
+    spawn_screen_state_thread(Arc::clone(&screen_active));
+
+    // Run the temperature-based cooler policy independently of the slow
+    // profile/WALT maintenance loop.  The governor waits 30 seconds for Nubia
+    // state initialization and then synchronizes Settings.Global with the
+    // stock /sys/kernel/fan driver every five seconds.
+    fan::spawn_fan_governor(Arc::clone(&screen_active));
+
     // Touch-boost threads start immediately; they block on input (~0 CPU idle).
     let last_touch = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(3600)));
-    let screen_active = Arc::new(AtomicBool::new(true));
     spawn_touch_threads(Arc::clone(&last_touch), Arc::clone(&screen_active));
 
     // One-time userspace setup after vendor post-boot tunables have settled.
@@ -659,7 +672,12 @@ fn main() {
     apply_surfaceflinger();
     apply_io_profile();
     apply_wifi_sleep_profile();
-    spawn_screen_state_thread(Arc::clone(&screen_active));
+    // The screen thread may already have applied the fallback during the
+    // 90-second settle delay.  Re-assert it because the selected profile above
+    // intentionally overwrites the same CPU/UFS nodes.
+    if !screen_active.load(Ordering::Relaxed) {
+        apply_screen_off_fallback();
+    }
 
     // Burst: re-assert WALT/VM every 60s for the first 20 min (WALT governor is
     // late; idempotent writes settle once its sysfs dir appears).
