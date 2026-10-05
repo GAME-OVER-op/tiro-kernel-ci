@@ -141,9 +141,10 @@ The kernel workflow applies the autonomy layer to the **actual common GKI Image*
 
 Recovery asks in this order: installed firmware, kernel variant, Kurumi runtime
 profile, optional automatic cooler control, LineageOS GPU DTB, optional Kurumi
-GPU voltage profile, and SELinux mode. It then prints one summary. Vol Up
-confirms and starts partition writes; Vol Down discards the selections and
-restarts the complete menu. No partition is written before confirmation.
+GPU voltage profile, and SELinux mode. Every question uses the same cursor:
+Vol Down moves `>` and Vol Up selects. The final summary uses that selector for
+`Confirm and install` or `Choose again`. No partition is written before
+confirmation.
 
 The firmware-dependent GPU choices behave as follows:
 
