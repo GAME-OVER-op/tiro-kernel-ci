@@ -1,8 +1,11 @@
 # Kurumi Fan Governor
 
-The fan governor runs in the existing static Rust `kurumi-daemon`. It is a
-policy layer over the stock Nubia fan driver and does not access PWM or GPIO
-directly.
+The fan governor is optional. Recovery offers cooler control immediately after
+the Economy/Balance/Full runtime profile and installs one of six binaries:
+`kurumi_eco`, `kurumi_balance`, `kurumi_full`, or the matching `_fan` variant.
+The three binaries without `_fan` do not compile or start the cooler thread.
+The `_fan` variants run the policy inside the static Rust `kurumi-daemon`. It is
+a layer over the stock Nubia fan driver and does not access PWM or GPIO directly.
 
 ## Interfaces
 
@@ -20,12 +23,19 @@ zero RPM. Disabling automatic mode writes `fan_enable=0`.
 
 ## Automatic policy
 
-The governor waits 30 seconds after the fan driver appears, then checks state
-every five seconds. It consumes the same `screen_active` state already maintained
-by `kurumi-daemon`; there is no second screen observer. SoC temperature is the
-maximum of the average available CPU and GPU thermal zones. While charging below
-100%, the battery curve is also evaluated and the higher level wins when the
-screen is on.
+The governor waits 30 seconds after the fan driver appears. Active checks run
+every 15 seconds with the screen on and every 60 seconds with the screen off.
+It consumes the same `screen_active` state already maintained by
+`kurumi-daemon`; there is no second screen observer. SoC temperature is the
+maximum of the average available CPU and GPU thermal zones. While charging
+below 100%, the battery curve is also evaluated and the higher level wins when
+the screen is on.
+
+When `nubia_parts_fan_enable=0`, the governor enters a minimal disabled state.
+It checks only that single Settings.Global value once per minute. It does not
+read fan level, fan sysfs, charge/capacity or thermal zones. The transition into
+disabled state powers the stock fan driver off once. A `0 -> 1` settings change
+returns to full synchronization on the next minute check.
 
 | Screen | Charging state | Temperature reads | Policy |
 | --- | --- | --- | --- |

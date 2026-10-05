@@ -1,11 +1,11 @@
 #
 # Kurumi Kernel - interactive flash-time menu (getevent / keycheck driven)
 # Sourced by anykernel.sh AFTER tools/ak3-core.sh so ui_print/$bin/abort exist.
-# Exports: KROM (redmagic|lineage), KGPU (skip|stock|kurumi_low|kurumi_balanced|kurumi_high), KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing)
+# Exports: KROM, KGPU, KROOT, KPROFILE, KFAN, KDAEMON_VARIANT and KSELINUX.
 #
 # Key model ($FUNCTION returns 0 for Vol Up, 1 for Vol Down):
-#   binary menus  -> Vol Up = Yes/first  | Vol Down = No/second
-#   scrolling menus -> Vol Down = move the '>' cursor | Vol Up = select pointed item
+#   binary menus    -> Vol Up = first option | Vol Down = second option
+#   scrolling menus -> Vol Down = move cursor | Vol Up = select current item
 #
 
 ui_print " ";
@@ -13,25 +13,24 @@ ui_print "==============================";
 ui_print " Kurumi Kernel installer";
 ui_print "==============================";
 
-# ---- key detection: getevent if the recovery exposes it, else keycheck binary ----
+# ---- key detection: getevent if the recovery exposes it, else keycheck ----
 keytest() {
   ui_print " " "   Press a Vol key to begin...";
-  (/system/bin/getevent -lc 1 2>&1 | /system/bin/grep VOLUME | /system/bin/grep " DOWN" > $home/kurumi_events) || return 1;
+  (/system/bin/getevent -lc 1 2>&1 | /system/bin/grep VOLUME | /system/bin/grep " DOWN" > "$home/kurumi_events") || return 1;
   return 0;
 }
 
 chooseport() {
   while true; do
-    /system/bin/getevent -lc 1 2>&1 | /system/bin/grep VOLUME | /system/bin/grep " DOWN" > $home/kurumi_events;
-    if `cat $home/kurumi_events 2>/dev/null | /system/bin/grep VOLUME >/dev/null`; then
+    /system/bin/getevent -lc 1 2>&1 | /system/bin/grep VOLUME | /system/bin/grep " DOWN" > "$home/kurumi_events";
+    if cat "$home/kurumi_events" 2>/dev/null | /system/bin/grep VOLUME >/dev/null; then
       break;
     fi;
   done;
-  if `cat $home/kurumi_events 2>/dev/null | /system/bin/grep VOLUMEUP >/dev/null`; then
+  if cat "$home/kurumi_events" 2>/dev/null | /system/bin/grep VOLUMEUP >/dev/null; then
     return 0;
-  else
-    return 1;
   fi;
+  return 1;
 }
 
 chooseportold() {
@@ -39,13 +38,13 @@ chooseportold() {
   $bin/keycheck;
   $bin/keycheck;
   SEL=$?;
-  if [ "$1" == "UP" ]; then
+  if [ "$1" = "UP" ]; then
     UP=$SEL;
-  elif [ "$1" == "DOWN" ]; then
+  elif [ "$1" = "DOWN" ]; then
     DOWN=$SEL;
-  elif [ $SEL -eq $UP ]; then
+  elif [ "$SEL" -eq "$UP" ]; then
     return 0;
-  elif [ $SEL -eq $DOWN ]; then
+  elif [ "$SEL" -eq "$DOWN" ]; then
     return 1;
   else
     abort "   Vol key not detected!";
@@ -62,156 +61,296 @@ else
   $FUNCTION "DOWN";
 fi;
 
-# ---- 0) Installed firmware (binary, always first) ----
-# RedMagic OS must keep the installed vendor_boot DTB untouched.
-# LineageOS may optionally receive the stock GPU DTB or one of the Kurumi tables.
-ui_print " ";
-ui_print "------------------------------";
-ui_print " Installed firmware";
-ui_print "   Vol+ = RedMagic OS (Stock)";
-ui_print "   Vol- = LineageOS (Custom)";
-ui_print "------------------------------";
-if $FUNCTION; then
-  KROM=redmagic;
-  KGPU=skip;
-  ui_print " " "   -> ROM: RedMagic OS";
-  ui_print "   -> vendor_boot DTB: untouched";
-else
-  KROM=lineage;
-  ui_print " " "   -> ROM: LineageOS";
+kurumi_kernel_label() {
+  case "$KR_IDX" in
+    1) KERNEL_LABEL="KernelSU";;
+    2) KERNEL_LABEL="KernelSU + SuSFS";;
+    *) KERNEL_LABEL="Stock (no root)";;
+  esac;
+}
 
-  # ---- 1) LineageOS GPU DTB selection ----
-  ui_print " ";
-  ui_print "------------------------------";
-  ui_print " GPU DTB for LineageOS";
-  ui_print "   Vol+ = Kurumi GPU table";
-  ui_print "   Vol- = Stock GPU DTB";
-  ui_print "------------------------------";
-  if $FUNCTION; then
-    KGPU=kurumi;
-    ui_print " " "   -> GPU DTB: Kurumi";
+kurumi_profile_label() {
+  case "$KP_IDX" in
+    0) PROFILE_LABEL="Economy";;
+    2) PROFILE_LABEL="Full";;
+    3) PROFILE_LABEL="Do not install";;
+    *) PROFILE_LABEL="Balance";;
+  esac;
+}
 
-    # ---- 2) Kurumi voltage profile (scrolling cursor menu) ----
-    ui_print " ";
-    ui_print "------------------------------";
-    ui_print " Kurumi GPU voltage profile";
-    ui_print "   Vol Down = move cursor";
-    ui_print "   Vol Up   = select";
-    ui_print "------------------------------";
-    KV_IDX=1;
-    while true; do
-      ui_print " ";
-      if [ $KV_IDX -eq 0 ]; then ui_print " > Low voltage"; else ui_print "   Low voltage"; fi;
-      if [ $KV_IDX -eq 1 ]; then ui_print " > Balanced"; else ui_print "   Balanced"; fi;
-      if [ $KV_IDX -eq 2 ]; then ui_print " > High voltage"; else ui_print "   High voltage"; fi;
-      if $FUNCTION; then
-        break;
-      else
-        KV_IDX=$((KV_IDX + 1));
-        [ $KV_IDX -gt 2 ] && KV_IDX=0;
-      fi;
-    done;
-    case $KV_IDX in
-      0) KGPU=kurumi_low;;
-      2) KGPU=kurumi_high;;
-      *) KGPU=kurumi_balanced;;
-    esac;
-    ui_print " " "   -> Kurumi voltage: ${KGPU#kurumi_}";
-  else
-    KGPU=stock;
-    ui_print " " "   -> GPU DTB: stock";
-  fi;
-fi;
+kurumi_voltage_label() {
+  case "$KV_IDX" in
+    0) VOLTAGE_LABEL="Low voltage";;
+    2) VOLTAGE_LABEL="High voltage";;
+    *) VOLTAGE_LABEL="Balanced";;
+  esac;
+}
 
-# ---- 3) Kernel variant (scrolling cursor menu) ----
-# CI may ship up to three real Images:
-#   kurumi_stock      = no root
-#   kurumi_ksu        = KernelSU-Next only
-#   kurumi_ksu_susfs  = KernelSU-Next + susfs
-ui_print " ";
-ui_print "------------------------------";
-ui_print " Kernel variant";
-ui_print "   Vol Down = move cursor";
-ui_print "   Vol Up   = select";
-ui_print "------------------------------";
-KR_IDX=0;
+# No partition is written until the user confirms the complete summary.
 while true; do
+  KROM="";
+  KGPU=skip;
+  KROOT=stock;
+  KPROFILE=skip;
+  KFAN=disabled;
+  KDAEMON_VARIANT="";
+  KDAEMON_REASON=user_skip;
+  KSELINUX=enforcing;
+
+  # ---- 1) Installed firmware ----
   ui_print " ";
-  if [ $KR_IDX -eq 0 ]; then ui_print " > Stock        - no root"; else ui_print "   Stock        - no root"; fi;
-  if [ -f "$home/files/image/kurumi_ksu" ]; then
-    if [ $KR_IDX -eq 1 ]; then ui_print " > KernelSU     - root only"; else ui_print "   KernelSU     - root only"; fi;
-  fi;
-  if [ -f "$home/files/image/kurumi_ksu_susfs" ]; then
-    if [ $KR_IDX -eq 2 ]; then ui_print " > KSU + susfs  - root + susfs"; else ui_print "   KSU + susfs  - root + susfs"; fi;
-  fi;
+  ui_print "------------------------------";
+  ui_print " Installed firmware";
+  ui_print "   Vol+ = RedMagic OS (Stock)";
+  ui_print "   Vol- = LineageOS (Custom)";
+  ui_print "------------------------------";
   if $FUNCTION; then
-    break;
+    KROM=redmagic;
+    KGPU=skip;
+    ROM_LABEL="RedMagic OS";
+    ui_print " " "   Selected: RedMagic OS";
   else
+    KROM=lineage;
+    ROM_LABEL="LineageOS";
+    ui_print " " "   Selected: LineageOS";
+  fi;
+
+  # ---- 2) Kernel variant ----
+  ui_print " ";
+  ui_print "------------------------------";
+  ui_print " Kernel variant";
+  ui_print "   Vol Down = next option";
+  ui_print "   Vol Up   = select";
+  ui_print " ";
+  ui_print "   Stock        - no root";
+  [ -f "$home/files/image/kurumi_ksu" ] && ui_print "   KernelSU     - root";
+  [ -f "$home/files/image/kurumi_ksu_susfs" ] && ui_print "   KSU + SuSFS  - root + SuSFS";
+  ui_print "------------------------------";
+  KR_IDX=0;
+  kurumi_kernel_label;
+  ui_print " " "   Current: $KERNEL_LABEL";
+  while true; do
+    if $FUNCTION; then
+      break;
+    fi;
     KR_IDX=$((KR_IDX + 1));
-    # Skip unavailable items while still keeping stable indexes: 0=stock, 1=ksu, 2=susfs.
     while true; do
-      [ $KR_IDX -gt 2 ] && KR_IDX=0;
-      [ $KR_IDX -eq 0 ] && break;
-      [ $KR_IDX -eq 1 ] && [ -f "$home/files/image/kurumi_ksu" ] && break;
-      [ $KR_IDX -eq 2 ] && [ -f "$home/files/image/kurumi_ksu_susfs" ] && break;
+      [ "$KR_IDX" -gt 2 ] && KR_IDX=0;
+      [ "$KR_IDX" -eq 0 ] && break;
+      [ "$KR_IDX" -eq 1 ] && [ -f "$home/files/image/kurumi_ksu" ] && break;
+      [ "$KR_IDX" -eq 2 ] && [ -f "$home/files/image/kurumi_ksu_susfs" ] && break;
       KR_IDX=$((KR_IDX + 1));
     done;
-  fi;
-done;
-case $KR_IDX in
-  1) KROOT=ksu;;
-  2) KROOT=susfs;;
-  *) KROOT=stock;;
-esac;
-ui_print " " "   -> kernel: $KROOT";
+    kurumi_kernel_label;
+    ui_print "   Current: $KERNEL_LABEL";
+  done;
+  case "$KR_IDX" in
+    1) KROOT=ksu;;
+    2) KROOT=susfs;;
+    *) KROOT=stock;;
+  esac;
+  ui_print " " "   Selected: $KERNEL_LABEL";
 
-# ---- 4) Battery daemon profile (scrolling cursor menu; 'Skip' = remove/do not install it) ----
-# Runtime is decided later after the target ramdisk is inspected:
-#   Magisk present -> overlay.d in boot/init_boot
-#   no Magisk + KSU/SuSFS -> /data/adb/modules/kurumi_kernel
-#   stock without Magisk -> skipped and stale KSU module removed.
-ui_print " ";
-ui_print "------------------------------";
-ui_print " Battery daemon profile";
-ui_print "   Vol Down = move cursor";
-ui_print "   Vol Up   = select";
-ui_print "------------------------------";
-KP_IDX=0;
-while true; do
+  # ---- 3) Kurumi runtime profile ----
+  KDAEMON_AVAILABLE=1;
+  if [ "$KROOT" = "stock" ]; then
+    ui_print " ";
+    ui_print "------------------------------";
+    ui_print " Checking Magisk for Stock kernel";
+    ui_print "   Read-only check; no partition writes";
+    ui_print "------------------------------";
+    if kurumi_probe_magisk_early; then
+      ui_print " " "   Magisk found";
+      ui_print "   Kurumi daemon can use overlay.d";
+    else
+      KDAEMON_AVAILABLE=0;
+      KDAEMON_REASON=no_magisk;
+      ui_print " " "   Magisk not found";
+      ui_print "   Kurumi daemon is unavailable";
+      ui_print "   with the Stock kernel";
+    fi;
+  fi;
+
+  if [ "$KDAEMON_AVAILABLE" = "1" ]; then
+    ui_print " ";
+    ui_print "------------------------------";
+    ui_print " Kurumi runtime profile";
+    ui_print "   Vol Down = next option";
+    ui_print "   Vol Up   = select";
+    ui_print " ";
+    ui_print "   Economy - maximum power saving";
+    ui_print "   Balance - balanced operation";
+    ui_print "   Full    - no Kurumi CPU limits";
+    ui_print "   Skip    - do not install daemon";
+    ui_print "------------------------------";
+    KP_IDX=1;
+    kurumi_profile_label;
+    ui_print " " "   Current: $PROFILE_LABEL";
+    while true; do
+      if $FUNCTION; then
+        break;
+      fi;
+      KP_IDX=$((KP_IDX + 1));
+      [ "$KP_IDX" -gt 3 ] && KP_IDX=0;
+      kurumi_profile_label;
+      ui_print "   Current: $PROFILE_LABEL";
+    done;
+    case "$KP_IDX" in
+      0) KPROFILE=eco;;
+      1) KPROFILE=balance;;
+      2) KPROFILE=full;;
+      *) KPROFILE=skip;;
+    esac;
+    [ "$KPROFILE" = "skip" ] || KDAEMON_REASON=selected;
+    ui_print " " "   Selected: $PROFILE_LABEL";
+  fi;
+
+  # ---- 4) Optional cooler-aware daemon binary ----
+  if [ "$KPROFILE" != "skip" ]; then
+    ui_print " ";
+    ui_print "------------------------------";
+    ui_print " Kurumi automatic cooler control";
+    ui_print " ";
+    ui_print "   Uses the stock Nubia fan driver.";
+    ui_print "   Automatically selects fan speed";
+    ui_print "   from CPU, GPU and battery heat.";
+    ui_print "   Screen and charging state are";
+    ui_print "   considered to reduce wakeups.";
+    ui_print "   A manual speed change pauses the";
+    ui_print "   temperature curve until automatic";
+    ui_print "   mode is switched off and on again.";
+    ui_print " ";
+    ui_print "   Vol+ = Enable automatic control";
+    ui_print "   Vol- = Keep stock/manual control";
+    ui_print "------------------------------";
+    if $FUNCTION; then
+      KFAN=enabled;
+      ui_print " " "   Selected: automatic control";
+    else
+      KFAN=disabled;
+      ui_print " " "   Selected: stock/manual control";
+    fi;
+  fi;
+
+  # ---- 5) LineageOS GPU DTB ----
+  if [ "$KROM" = "lineage" ]; then
+    ui_print " ";
+    ui_print "------------------------------";
+    ui_print " GPU DTB for LineageOS";
+    ui_print "   Vol+ = Kurumi GPU table";
+    ui_print "   Vol- = Stock GPU DTB";
+    ui_print "------------------------------";
+    if $FUNCTION; then
+      ui_print " " "   Selected: Kurumi GPU table";
+
+      # ---- 6) Kurumi GPU voltage profile ----
+      ui_print " ";
+      ui_print "------------------------------";
+      ui_print " Kurumi GPU voltage profile";
+      ui_print "   Vol Down = next option";
+      ui_print "   Vol Up   = select";
+      ui_print " ";
+      ui_print "   Low voltage";
+      ui_print "   Balanced";
+      ui_print "   High voltage";
+      ui_print "------------------------------";
+      KV_IDX=1;
+      kurumi_voltage_label;
+      ui_print " " "   Current: $VOLTAGE_LABEL";
+      while true; do
+        if $FUNCTION; then
+          break;
+        fi;
+        KV_IDX=$((KV_IDX + 1));
+        [ "$KV_IDX" -gt 2 ] && KV_IDX=0;
+        kurumi_voltage_label;
+        ui_print "   Current: $VOLTAGE_LABEL";
+      done;
+      case "$KV_IDX" in
+        0) KGPU=kurumi_low;;
+        2) KGPU=kurumi_high;;
+        *) KGPU=kurumi_balanced;;
+      esac;
+      ui_print " " "   Selected: $VOLTAGE_LABEL";
+    else
+      KGPU=stock;
+      ui_print " " "   Selected: Stock GPU DTB";
+    fi;
+  fi;
+
+  # ---- 7) SELinux mode ----
   ui_print " ";
-  if [ $KP_IDX -eq 0 ]; then ui_print " > Economy - max battery + delayed push"; else ui_print "   Economy - max battery + delayed push"; fi;
-  if [ $KP_IDX -eq 1 ]; then ui_print " > Balance - balanced CPU + delayed push"; else ui_print "   Balance - balanced CPU + delayed push"; fi;
-  if [ $KP_IDX -eq 2 ]; then ui_print " > Full    - no CPU limits + soft push"; else ui_print "   Full    - no CPU limits + soft push"; fi;
-  if [ $KP_IDX -eq 3 ]; then ui_print " > Skip    - remove / do not install daemon"; else ui_print "   Skip    - remove / do not install daemon"; fi;
+  ui_print "------------------------------";
+  ui_print " SELinux mode";
+  ui_print "   Vol+ = Enforcing (recommended)";
+  ui_print "   Vol- = Permissive";
+  ui_print "------------------------------";
   if $FUNCTION; then
-    break;
+    KSELINUX=enforcing;
+    SELINUX_LABEL="Enforcing";
   else
-    KP_IDX=$((KP_IDX + 1));
-    [ $KP_IDX -gt 3 ] && KP_IDX=0;
+    KSELINUX=permissive;
+    SELINUX_LABEL="Permissive";
   fi;
+  ui_print " " "   Selected: $SELINUX_LABEL";
+
+  if [ "$KPROFILE" != "skip" ]; then
+    KDAEMON_VARIANT="kurumi_$KPROFILE";
+    [ "$KFAN" = "enabled" ] && KDAEMON_VARIANT="${KDAEMON_VARIANT}_fan";
+  fi;
+
+  case "$KGPU" in
+    skip) GPU_LABEL="Unchanged (RedMagic OS)";;
+    stock) GPU_LABEL="Stock GPU DTB";;
+    kurumi_low) GPU_LABEL="Kurumi - Low voltage";;
+    kurumi_high) GPU_LABEL="Kurumi - High voltage";;
+    *) GPU_LABEL="Kurumi - Balanced";;
+  esac;
+  case "$KPROFILE" in
+    eco) DAEMON_LABEL="Economy ($KDAEMON_VARIANT)";;
+    balance) DAEMON_LABEL="Balance ($KDAEMON_VARIANT)";;
+    full) DAEMON_LABEL="Full ($KDAEMON_VARIANT)";;
+    *)
+      if [ "$KDAEMON_REASON" = "no_magisk" ]; then
+        DAEMON_LABEL="Not available - Magisk not found";
+      else
+        DAEMON_LABEL="Not installed";
+      fi
+      ;;
+  esac;
+  if [ "$KPROFILE" = "skip" ]; then
+    FAN_LABEL="Not installed";
+  elif [ "$KFAN" = "enabled" ]; then
+    FAN_LABEL="Automatic Kurumi control";
+  else
+    FAN_LABEL="Stock/manual control";
+  fi;
+
+  # ---- final review; Vol Down restarts the complete selection ----
+  ui_print " ";
+  ui_print "==============================";
+  ui_print " Installation summary";
+  ui_print "==============================";
+  ui_print "   Firmware : $ROM_LABEL";
+  ui_print "   Kernel   : $KERNEL_LABEL";
+  ui_print "   Daemon   : $DAEMON_LABEL";
+  ui_print "   Cooler   : $FAN_LABEL";
+  ui_print "   GPU DTB  : $GPU_LABEL";
+  ui_print "   SELinux  : $SELINUX_LABEL";
+  ui_print "------------------------------";
+  ui_print "   Vol+ = Confirm and install";
+  ui_print "   Vol- = Choose again";
+  ui_print "------------------------------";
+  if $FUNCTION; then
+    ui_print " " "   Settings confirmed. Installing...";
+    break;
+  fi;
+
+  ui_print " ";
+  ui_print "==============================";
+  ui_print " Repeating configuration";
+  ui_print "==============================";
 done;
-case $KP_IDX in
-  0) KPROFILE=eco;;
-  1) KPROFILE=balance;;
-  2) KPROFILE=full;;
-  3) KPROFILE=skip;;
-esac;
-ui_print " " "   -> profile: $KPROFILE";
 
-# ---- 5) SELinux mode (binary) ----
-ui_print " ";
-ui_print "------------------------------";
-ui_print " SELinux mode";
-ui_print "   Vol+ = Permissive";
-ui_print "   Vol- = Enforcing (stock)";
-ui_print "------------------------------";
-if $FUNCTION; then
-  KSELINUX=permissive;
-  ui_print " " "   -> SELinux: permissive";
-else
-  KSELINUX=enforcing;
-  ui_print " " "   -> SELinux: enforcing";
-fi;
-
-rm -f $home/kurumi_events;
+rm -f "$home/kurumi_events";
 ui_print " ";

@@ -29,9 +29,65 @@ no_magisk_check=1
 # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
 . tools/ak3-core.sh
 
+## Read-only early Magisk probe used by the interactive menu for the stock
+## kernel choice.  The check happens before any partition is written.
+KURUMI_EARLY_MAGISK_CHECKED=0
+KURUMI_EARLY_MAGISK=0
+KURUMI_MAGISK_PROBE_PART=""
+
+kurumi_find_magisk_probe_partition() {
+  local p;
+  KURUMI_MAGISK_PROBE_PART="";
+  for p in \
+    /dev/block/bootdevice/by-name/init_boot$slot \
+    /dev/block/by-name/init_boot$slot \
+    /dev/block/bootdevice/by-name/init_boot \
+    /dev/block/by-name/init_boot \
+    /dev/block/bootdevice/by-name/boot$slot \
+    /dev/block/by-name/boot$slot \
+    /dev/block/bootdevice/by-name/boot \
+    /dev/block/by-name/boot; do
+    if [ -e "$p" ]; then
+      KURUMI_MAGISK_PROBE_PART="$p";
+      return 0;
+    fi;
+  done;
+  return 1;
+}
+
+kurumi_probe_magisk_early() {
+  local oldpwd rc;
+  if [ "$KURUMI_EARLY_MAGISK_CHECKED" = "1" ]; then
+    [ "$KURUMI_EARLY_MAGISK" = "1" ];
+    return $?;
+  fi;
+
+  KURUMI_EARLY_MAGISK_CHECKED=1;
+  KURUMI_EARLY_MAGISK=0;
+  kurumi_find_magisk_probe_partition || return 1;
+
+  rm -rf "$home/kurumi_magisk_probe";
+  mkdir -p "$home/kurumi_magisk_probe" || return 1;
+  oldpwd="$(pwd)";
+  cd "$home/kurumi_magisk_probe" || return 1;
+
+  if dd if="$KURUMI_MAGISK_PROBE_PART" of=probe.img bs=1048576 2>/dev/null && \
+     "$bin"/magiskboot unpack probe.img >/dev/null 2>&1 && \
+     [ -f ramdisk.cpio ]; then
+    "$bin"/magiskboot cpio ramdisk.cpio test >/dev/null 2>&1;
+    rc=$?;
+    [ $((rc & 3)) -eq 1 ] && KURUMI_EARLY_MAGISK=1;
+  fi;
+
+  cd "$oldpwd";
+  rm -rf "$home/kurumi_magisk_probe";
+  [ "$KURUMI_EARLY_MAGISK" = "1" ];
+}
+
 ## ---- Kurumi interactive installer (keycheck/getevent driven menus) ----
 ## Sets KROM (redmagic|lineage), KGPU (skip|stock|kurumi_low|kurumi_balanced|kurumi_high),
-## KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KSELINUX (permissive|enforcing)
+## KROOT (stock|ksu|susfs), KPROFILE (eco|balance|full|skip), KFAN (enabled|disabled),
+## KDAEMON_VARIANT and KSELINUX (permissive|enforcing).
 . $home/tools/kurumi_menu.sh
 
 KURUMI_MODULE_DIR=/data/adb/modules/kurumi_kernel
@@ -56,15 +112,15 @@ kurumi_data_modules_ready() {
 kurumi_install_data_module() {
   local srcbin;
   [ "$KPROFILE" = "skip" ] && { kurumi_remove_data_module; return 0; };
-  srcbin="$home/files/kurumi_bin/kurumi_$KPROFILE";
-  [ -f "$srcbin" ] || { ui_print " " "WARNING: kurumi_$KPROFILE not found - KSU module skipped"; return 1; };
+  srcbin="$home/files/kurumi_bin/$KDAEMON_VARIANT";
+  [ -n "$KDAEMON_VARIANT" ] && [ -f "$srcbin" ] || { ui_print " " "WARNING: selected Kurumi daemon binary not found - KSU module skipped"; return 1; };
   [ -f "$home/files/kurumi_module/module.prop" ] || { ui_print " " "WARNING: kurumi module.prop missing - KSU module skipped"; return 1; };
   [ -f "$home/files/kurumi_module/service.sh" ] || { ui_print " " "WARNING: kurumi service.sh missing - KSU module skipped"; return 1; };
   if ! kurumi_data_modules_ready; then
     ui_print " " "WARNING: /data/adb/modules is not writable - Kurumi daemon module skipped";
     return 1;
   fi;
-  ui_print " " "Kurumi: installing daemon as KSU module ($KPROFILE)";
+  ui_print " " "Kurumi: installing daemon as KSU module ($KDAEMON_VARIANT)";
   rm -rf "$KURUMI_MODULE_DIR" 2>/dev/null;
   mkdir -p "$KURUMI_MODULE_DIR" || { ui_print " " "WARNING: cannot create $KURUMI_MODULE_DIR"; return 1; };
   cp -f "$home/files/kurumi_module/module.prop" "$KURUMI_MODULE_DIR/module.prop" || return 1;
@@ -82,11 +138,11 @@ kurumi_stage_overlay_profile() {
   rm -rf "$home/kurumi_overlay";
   [ "$KPROFILE" = "skip" ] && return 1;
   [ -d "$home/kurumi_overlay_template" ] || { ui_print " " "WARNING: overlay.d template missing - Magisk daemon skipped"; return 1; };
-  [ -f "$home/files/kurumi_bin/kurumi_$KPROFILE" ] || { ui_print " " "WARNING: kurumi_$KPROFILE not found - Magisk daemon skipped"; return 1; };
+  [ -n "$KDAEMON_VARIANT" ] && [ -f "$home/files/kurumi_bin/$KDAEMON_VARIANT" ] || { ui_print " " "WARNING: selected Kurumi daemon binary not found - Magisk daemon skipped"; return 1; };
   cp -rf "$home/kurumi_overlay_template" "$home/kurumi_overlay";
   mkdir -p "$home/kurumi_overlay/sbin";
-  cp -f "$home/files/kurumi_bin/kurumi_$KPROFILE" "$home/kurumi_overlay/sbin/kurumi_battery";
-  ui_print " " "Kurumi: staged '$KPROFILE' daemon profile for Magisk overlay.d";
+  cp -f "$home/files/kurumi_bin/$KDAEMON_VARIANT" "$home/kurumi_overlay/sbin/kurumi_battery";
+  ui_print " " "Kurumi: staged '$KDAEMON_VARIANT' for Magisk overlay.d";
   return 0;
 }
 

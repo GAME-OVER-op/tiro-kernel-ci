@@ -26,8 +26,8 @@
 
 #include <linux/kurumi_screen_state.h>
 
-#define KURUMI_SCREEN_ON_POLL_MS  60000ULL
-#define KURUMI_SCREEN_OFF_POLL_MS 30000ULL
+#define KURUMI_SCREEN_ON_POLL_MS  15000ULL
+#define KURUMI_SCREEN_OFF_POLL_MS 60000ULL
 
 enum kurumi_screen_state {
 	KURUMI_SCREEN_UNKNOWN = 0,

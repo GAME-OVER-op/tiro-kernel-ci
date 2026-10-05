@@ -23,7 +23,9 @@ const GLOBAL_FAN_ENABLE: &str = "nubia_parts_fan_enable";
 const GLOBAL_FAN_LEVEL: &str = "nubia_parts_fan_speed_level";
 
 const INITIALIZATION_SECS: u64 = 30;
-const POLL_SECS: u64 = 5;
+const SCREEN_ON_POLL_SECS: u64 = 15;
+const SCREEN_OFF_POLL_SECS: u64 = 60;
+const SETTINGS_DISABLED_POLL_SECS: u64 = 60;
 const PROBE_REFRESH_SECS: u64 = 60;
 const LOWER_CONFIRMATIONS: u8 = 3;
 
@@ -215,17 +217,9 @@ impl KurumiFanGovernor {
         self.last_probe_refresh = Instant::now();
     }
 
-    fn read_snapshot(&self) -> Option<Snapshot> {
+    fn read_snapshot(&self, global_auto: bool) -> Option<Snapshot> {
         let sysfs_enable = read_u8(FAN_ENABLE_PATH)? != 0;
         let sysfs_level = valid_level(read_u8(FAN_LEVEL_PATH)?)?;
-
-        let global_auto = match get_global_u8(GLOBAL_FAN_ENABLE).and_then(valid_bool) {
-            Some(value) => value,
-            None => {
-                put_global_u8(GLOBAL_FAN_ENABLE, 1);
-                true
-            }
-        };
 
         let global_level = match get_global_u8(GLOBAL_FAN_LEVEL).and_then(valid_level) {
             Some(value) => value,
@@ -251,9 +245,29 @@ impl KurumiFanGovernor {
     }
 
     fn remember_current_state(&mut self) {
-        if let Some(snapshot) = self.read_snapshot() {
+        let global_auto = get_global_u8(GLOBAL_FAN_ENABLE)
+            .and_then(valid_bool)
+            .unwrap_or(true);
+        if let Some(snapshot) = self.read_snapshot(global_auto) {
             self.remember(snapshot);
         }
+    }
+
+    fn enter_settings_disabled_mode(&mut self) {
+        // The transition is the only time disabled mode touches fan sysfs.
+        // Afterwards the governor reads only nubia_parts_fan_enable once per
+        // minute until the user enables automatic control again.
+        if self.previous_global_auto != Some(false) {
+            let _ = write_value(Path::new(FAN_ENABLE_PATH), "0");
+        }
+        self.previous_global_auto = Some(false);
+        self.previous_global_level = None;
+        self.previous_sysfs_enable = None;
+        self.previous_sysfs_level = None;
+        self.user_override = false;
+        self.screen_suspended = false;
+        self.suspended_level = None;
+        self.reset_lowering();
     }
 
     fn initialization_tick(&mut self, snapshot: Snapshot, context: RuntimeContext) {
@@ -682,9 +696,28 @@ fn fan_governor_loop(screen_active: Arc<AtomicBool>) {
     let mut governor = KurumiFanGovernor::new();
 
     loop {
+        let screen_on = screen_active.load(Ordering::Relaxed);
+        let global_auto = match get_global_u8(GLOBAL_FAN_ENABLE).and_then(valid_bool) {
+            Some(value) => value,
+            None => {
+                put_global_u8(GLOBAL_FAN_ENABLE, 1);
+                true
+            }
+        };
+
+        if !global_auto {
+            governor.enter_settings_disabled_mode();
+            thread::sleep(Duration::from_secs(SETTINGS_DISABLED_POLL_SECS));
+            continue;
+        }
+
         if !Path::new(FAN_ENABLE_PATH).exists() || !Path::new(FAN_LEVEL_PATH).exists() {
             governor.reset_for_missing_driver();
-            thread::sleep(Duration::from_secs(POLL_SECS));
+            thread::sleep(Duration::from_secs(if screen_on {
+                SCREEN_ON_POLL_SECS
+            } else {
+                SCREEN_OFF_POLL_SECS
+            }));
             continue;
         }
 
@@ -696,11 +729,11 @@ fn fan_governor_loop(screen_active: Arc<AtomicBool>) {
             .map(|percent| percent < 100)
             .unwrap_or(true);
         let context = RuntimeContext {
-            screen_on: screen_active.load(Ordering::Relaxed),
+            screen_on,
             charging_effective: charging && battery_below_full,
         };
 
-        if let Some(snapshot) = governor.read_snapshot() {
+        if let Some(snapshot) = governor.read_snapshot(global_auto) {
             if governor.initialized {
                 governor.tick(snapshot, context);
             } else {
@@ -708,7 +741,11 @@ fn fan_governor_loop(screen_active: Arc<AtomicBool>) {
             }
         }
 
-        thread::sleep(Duration::from_secs(POLL_SECS));
+        thread::sleep(Duration::from_secs(if screen_on {
+            SCREEN_ON_POLL_SECS
+        } else {
+            SCREEN_OFF_POLL_SECS
+        }));
     }
 }
 

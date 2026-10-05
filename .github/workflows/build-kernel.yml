@@ -100,13 +100,13 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
           cd kurumi-daemon
-          # Build all THREE profiles from the single source. CPU, I/O and Wi-Fi
-          # sleep/push policy are selected by cargo feature (eco|balance|full).
-          # The flasher installs whichever one the user picks at flash time.
+          # Build each profile both without and with the optional fan governor.
+          # The flasher selects one of the six binaries from the profile and
+          # cooler answers given at flash time.
           BINDIR="$GITHUB_WORKSPACE/anykernel/files/kurumi_bin"
           mkdir -p "$BINDIR"
           for p in eco balance full; do
-            echo "=== building kurumi profile: $p ==="
+            echo "=== building kurumi profile: $p (no fan governor) ==="
             cargo build --release --target aarch64-unknown-linux-musl --no-default-features --features "$p"
             BIN=target/aarch64-unknown-linux-musl/release/kurumi
             [ -f "$BIN" ] || { echo "ERROR: kurumi ($p) binary not produced"; exit 1; }
@@ -115,6 +115,17 @@ jobs:
             file "$BIN" | grep -q 'ARM aarch64'      || { echo "ERROR: $p daemon is not an aarch64 binary"; exit 1; }
             file "$BIN" | grep -q 'statically linked' || { echo "ERROR: $p daemon is not statically linked"; exit 1; }
             install -D -m0755 "$BIN" "$BINDIR/kurumi_$p"
+            rm -f "$BIN"
+
+            echo "=== building kurumi profile: $p (fan governor enabled) ==="
+            cargo build --release --target aarch64-unknown-linux-musl --no-default-features --features "$p,fan"
+            BIN=target/aarch64-unknown-linux-musl/release/kurumi
+            [ -f "$BIN" ] || { echo "ERROR: kurumi ($p + fan) binary not produced"; exit 1; }
+            aarch64-linux-gnu-strip "$BIN" || true
+            file "$BIN"
+            file "$BIN" | grep -q 'ARM aarch64'      || { echo "ERROR: $p fan daemon is not an aarch64 binary"; exit 1; }
+            file "$BIN" | grep -q 'statically linked' || { echo "ERROR: $p fan daemon is not statically linked"; exit 1; }
+            install -D -m0755 "$BIN" "$BINDIR/kurumi_${p}_fan"
             rm -f "$BIN"   # force a clean relink for the next feature set
           done
           echo '--- built profile binaries ---'; ls -la "$BINDIR"
@@ -832,11 +843,13 @@ jobs:
           IMGNAME="$(cat "$KIMG/imgname" 2>/dev/null || echo Image.gz)"
           echo "stock image: $KIMG/kurumi_stock (flash name: $IMGNAME)"
           [ -f "$AK/anykernel.sh" ] || { echo 'ERROR: anykernel/ framework missing from repo'; exit 1; }
-          # All three profile binaries must have been produced by the Rust step above.
+          # All six profile/cooler binaries must have been produced by the Rust step above.
           for p in eco balance full; do
-            KB="$AK/files/kurumi_bin/kurumi_$p"
-            [ -f "$KB" ] || { echo "ERROR: profile binary kurumi_$p missing (Rust build step did not run?)"; exit 1; }
-            file "$KB" | grep -q 'ELF' || { echo "ERROR: kurumi_$p is not an ELF binary"; exit 1; }
+            for suffix in '' '_fan'; do
+              KB="$AK/files/kurumi_bin/kurumi_${p}${suffix}"
+              [ -f "$KB" ] || { echo "ERROR: profile binary kurumi_${p}${suffix} missing (Rust build step did not run?)"; exit 1; }
+              file "$KB" | grep -q 'ELF' || { echo "ERROR: kurumi_${p}${suffix} is not an ELF binary"; exit 1; }
+            done
           done
           # interactive-installer assets must be shipped too
           [ -f "$AK/tools/keycheck" ]       || { echo 'ERROR: tools/keycheck missing'; exit 1; }

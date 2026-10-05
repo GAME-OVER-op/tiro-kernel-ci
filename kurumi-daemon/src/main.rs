@@ -35,6 +35,7 @@
 //       comes up late), then re-assert every 3h (idempotent).
 // =====================================================================
 
+#[cfg(feature = "fan")]
 mod fan;
 
 use std::fs::{self, File};
@@ -69,8 +70,8 @@ const KURUMI_SCREEN_STATE: &str = "/sys/kernel/kurumi_screen/state";
 const KURUMI_SCREEN_SEQ: &str = "/sys/kernel/kurumi_screen/seq";
 const KURUMI_SCREEN_POLL_MS: &str = "/sys/kernel/kurumi_screen/poll_ms";
 const SCREEN_OFF_DEBOUNCE_SECS: u64 = 30;
-const SCREEN_ON_DEFAULT_POLL_MS: u64 = 60_000;
-const SCREEN_OFF_DEFAULT_POLL_MS: u64 = 30_000;
+const SCREEN_ON_DEFAULT_POLL_MS: u64 = 15_000;
+const SCREEN_OFF_DEFAULT_POLL_MS: u64 = 60_000;
 const SCREEN_POLL_MIN_MS: u64 = 5_000;
 const SCREEN_POLL_MAX_MS: u64 = 300_000;
 
@@ -653,10 +654,10 @@ fn main() {
     let screen_active = Arc::new(AtomicBool::new(read_screen_state() != ScreenState::Off));
     spawn_screen_state_thread(Arc::clone(&screen_active));
 
-    // Run the temperature-based cooler policy independently of the slow
-    // profile/WALT maintenance loop.  The governor waits 30 seconds for Nubia
-    // state initialization and then synchronizes Settings.Global with the
-    // stock /sys/kernel/fan driver every five seconds.
+    // Fan-enabled build variants run the temperature-based cooler policy
+    // independently of the slow profile/WALT maintenance loop.  Builds made
+    // without the `fan` feature contain no cooler thread or cooler polling.
+    #[cfg(feature = "fan")]
     fan::spawn_fan_governor(Arc::clone(&screen_active));
 
     // Touch-boost threads start immediately; they block on input (~0 CPU idle).

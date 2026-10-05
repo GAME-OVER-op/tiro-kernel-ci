@@ -28,8 +28,18 @@ The flashable AnyKernel package can ship up to three real kernel images and show
 
 Vol Down moves the cursor; Vol Up selects, matching the Rust profile selector.
 
-## Runtime profile daemon (overlay.d)
-The battery tuning ships inside the kernel flash - no separate Magisk module.
+## Runtime profile daemon (overlay.d / KernelSU module)
+The runtime tuning ships inside the kernel flash. Recovery selects Economy,
+Balance or Full and then independently asks whether Kurumi automatic cooler
+control should be included. CI produces six binaries: three profile-only files
+and three matching `_fan` variants. A profile-only binary contains no cooler
+thread or cooler polling.
+
+For the Stock kernel, recovery performs a read-only Magisk check before showing
+the runtime-profile question. When Magisk is absent the daemon question is
+skipped. KernelSU and KernelSU+SuSFS can install the daemon through the bundled
+`/data/adb/modules/kurumi_kernel` module without Magisk.
+
 `anykernel/ramdisk/overlay.d/` is injected into the device ramdisk (`init_boot`
 on GKI) and imported by Magisk, which runs `kurumi_battery` on boot:
 - WALT smoothing: `up_rate_limit_us=1000`, `down_rate_limit_us=2000`, `hispeed_load=90`.
@@ -58,7 +68,7 @@ Screen-off autonomy is kernel-assisted: when the built Image contains
 state     # on / off / unknown
 seq       # increments when state changes
 since_ms  # milliseconds since last change
-poll_ms   # recommended daemon poll delay: 30s off, 60s on/unknown
+poll_ms   # recommended daemon poll delay: 60s off, 15s on/unknown
 ```
 
 The daemon reads only this cheap sysfs state. It does not call `dumpsys`,
@@ -127,9 +137,15 @@ The kernel workflow applies the autonomy layer to the **actual common GKI Image*
 > re-targets `init_boot` (`reset_ak` + `setup_ak`) and repacks ONLY its ramdisk with
 > overlay.d added. Device check is OFF (`do.devicecheck=0`).
 
-### Flash-time ROM and GPU DTB selection
+### Flash-time selection order
 
-The installer asks for the installed firmware **before** the kernel/profile menus:
+Recovery asks in this order: installed firmware, kernel variant, Kurumi runtime
+profile, optional automatic cooler control, LineageOS GPU DTB, optional Kurumi
+GPU voltage profile, and SELinux mode. It then prints one summary. Vol Up
+confirms and starts partition writes; Vol Down discards the selections and
+restarts the complete menu. No partition is written before confirmation.
+
+The firmware-dependent GPU choices behave as follows:
 
 - **RedMagic OS (Stock)** sets the GPU DTB action to `skip`. The installer does not
   stage, unpack, repack, or write `vendor_boot` for the GPU table at all.
