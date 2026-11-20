@@ -52,20 +52,63 @@ jobs:
       - name: Checkout CI repo
         uses: actions/checkout@v4
 
+      # Inline replacement for easimon/maximize-build-space@v10. On the newer
+      # ubuntu-24.04 runner images /mnt is on the SAME filesystem as /, so the
+      # action's second loop PV (on /mnt/tmp-pv.img) swallows the root reserve
+      # and `apt-get update` dies with "No space left on device" (exit 100).
+      # Keep a real root reserve for apt/toolchain and only add a temp PV when
+      # /mnt is genuinely a separate filesystem.
       - name: Maximize build disk space
-        uses: easimon/maximize-build-space@v10
-        with:
-          root-reserve-mb: 8192
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+
+          BUILD_MOUNT_PATH=/mnt/src
+          VG_NAME=buildvg
+          sudo mkdir -p "$BUILD_MOUNT_PATH"
+
+          ROOT_DEV="$(df --output=source / | tail -1)"
+          TMP_DEV="$(df --output=source /mnt | tail -1)"
+          echo "root device: $ROOT_DEV ; /mnt device: $TMP_DEV"
+
+          # Leave 12 GiB truly free on / for apt, rustup and the toolchain.
+          ROOT_FREE_KB="$(df --block-size=1024 --output=avail / | tail -1)"
+          ROOT_RESERVE_KB=$((12 * 1024 * 1024))
+          ROOT_LVM_SIZE_KB=$((ROOT_FREE_KB - ROOT_RESERVE_KB))
+          sudo touch /pv.img
+          sudo fallocate -z -l "$((ROOT_LVM_SIZE_KB * 1024))" /pv.img
+          ROOT_LOOP_DEV="$(sudo losetup --find --show /pv.img)"
+          sudo pvcreate -f "$ROOT_LOOP_DEV"
+          PVS="$ROOT_LOOP_DEV"
+
+          if [ "$TMP_DEV" != "$ROOT_DEV" ]; then
+            TMP_FREE_KB="$(df --block-size=1024 --output=avail /mnt | tail -1)"
+            TMP_LVM_SIZE_KB=$((TMP_FREE_KB - 100 * 1024))
+            sudo touch /mnt/tmp-pv.img
+            sudo fallocate -z -l "$((TMP_LVM_SIZE_KB * 1024))" /mnt/tmp-pv.img
+            TMP_LOOP_DEV="$(sudo losetup --find --show /mnt/tmp-pv.img)"
+            sudo pvcreate -f "$TMP_LOOP_DEV"
+            PVS="$PVS $TMP_LOOP_DEV"
+            echo "added separate /mnt PV to $VG_NAME"
+          else
+            echo "NOTE: /mnt shares / ($ROOT_DEV) - skipping temp PV to protect root free space"
+          fi
+
+          sudo vgcreate "$VG_NAME" $PVS
           # 16 GB swap: the vmlinux LTO link + parallel image/module actions peak
-          # well above the 16 GB runner RAM; without headroom the runner is OOM-killed
-          # ("hosted runner lost communication"). Swap lives on the freed build volume.
-          swap-size-mb: 16384
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          build-mount-path: /mnt/src
+          # well above the 16 GB runner RAM; without headroom the runner is OOM-killed.
+          sudo lvcreate -L 16384M -n swap "$VG_NAME"
+          sudo mkswap "/dev/mapper/${VG_NAME}-swap"
+          sudo swapon "/dev/mapper/${VG_NAME}-swap"
+          sudo lvcreate -l 100%FREE -n buildlv "$VG_NAME"
+          sudo mkfs.ext4 -Enodiscard -m0 "/dev/mapper/${VG_NAME}-buildlv"
+          sudo mount "/dev/mapper/${VG_NAME}-buildlv" "$BUILD_MOUNT_PATH"
+          sudo chown -R runner:runner "$BUILD_MOUNT_PATH"
+          df -h / /mnt "$BUILD_MOUNT_PATH"
 
       - name: Give runner user ownership of the build mount
         run: sudo chown -R "$USER":"$USER" /mnt/src
