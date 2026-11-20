@@ -449,6 +449,13 @@ if selhide.exists():
     txt = txt.replace('static ssize_t my_write_access(', 'ssize_t my_write_access(')
     txt = txt.replace('static int my_setprocattr(', 'int my_setprocattr(')
     txt = txt.replace('static int __nocfi my_setprocattr(', 'int __nocfi my_setprocattr(')
+    # KURUMI_KSU_SUSFS_FAKE_STATE: susfs4ksu v2.2.0's common patch declares
+    # `extern struct selinux_state fake_state;` in security/selinux/selinuxfs.c
+    # and hooks.c (used by my_write_context/my_write_access/my_setprocattr).
+    # Its KSU-side patch would export it from selinux_hide.c, but that hunk no
+    # longer applies to KernelSU-Next v3.4.2, so provide it here for 6.1 GKI.
+    if 'struct selinux_state fake_state;' not in txt:
+        txt += '\n\n#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)\nstruct selinux_state fake_state;\n#endif\n'
     txt = txt.replace('static bool ksu_selinux_hide_running __read_mostly = false;', 'bool ksu_selinux_hide_running __read_mostly = false;')
     txt = txt.replace('static struct selinux_state fake_state;', 'struct selinux_state fake_state;')
     txt = txt.replace('static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);', 'DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);')
