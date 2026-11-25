@@ -1033,6 +1033,7 @@ jobs:
             echo
 
             echo "### Built-image config highlights"
+            echo "From the stock Image audit; KSU/SUSFS variants add CONFIG_KSU and CONFIG_KSU_SUSFS on top."
             if [ -f "$AUD/final.config" ]; then
               for sym in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KURUMI_SCREEN_STATE \
                          CONFIG_LRU_GEN CONFIG_LRU_GEN_ENABLED CONFIG_WQ_POWER_EFFICIENT_DEFAULT \
