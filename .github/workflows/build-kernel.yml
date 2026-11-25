@@ -17,6 +17,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # Required for `gh release create/upload` at the end of the job.
+    permissions:
+      contents: write
     env:
       # kernel "author" -> shows as (kurumi@dev) in /proc/version
       KBUILD_BUILD_USER: kurumi
@@ -955,3 +958,36 @@ jobs:
           path: out-artifacts/**
           if-no-files-found: warn
           retention-days: 14
+
+      # Publish the recovery-flashable AnyKernel ZIP as a GitHub Release.
+      # Tag is unique per workflow run, so reruns overwrite their own release
+      # instead of colliding with older builds.
+      - name: Publish flashable ZIP to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="kurumi-build-${GITHUB_RUN_NUMBER}"
+          TITLE="Kurumi Kernel build #${GITHUB_RUN_NUMBER}"
+          ZIP="$GITHUB_WORKSPACE/out-artifacts/Kurumi_kernel_build${GITHUB_RUN_NUMBER}.zip"
+          SUMS="$GITHUB_WORKSPACE/out-artifacts/SHA256SUMS"
+          [ -f "$ZIP" ] || { echo "ERROR: flashable ZIP missing: $ZIP"; exit 1; }
+          ( cd "$GITHUB_WORKSPACE/out-artifacts" && sha256sum "$(basename "$ZIP")" > SHA256SUMS )
+          NOTES="$(cat <<EOF
+          Kurumi Kernel for tiro (NX769J / RedMagic 9 Pro), GKI android14-6.1.
+
+          Flashable AnyKernel ZIP for recovery: Stock / KernelSU / KernelSU+SuSFS.
+          Test in RAM first with \`fastboot boot boot.img\` from the \`images/\` build artifact.
+
+          Workflow run: ${GITHUB_RUN_NUMBER}
+          Commit: ${GITHUB_SHA}
+          EOF
+          )"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" "$SUMS" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+            echo "Updated release $TAG"
+          else
+            gh release create "$TAG" "$ZIP" "$SUMS" --title "$TITLE" --notes "$NOTES"
+            echo "Created release $TAG"
+          fi
